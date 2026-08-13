@@ -1,0 +1,23 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.local/
+*.egg-info/
+
+# Runtime data must not enter version control.
+data/uploads/*
+data/*.db
+data/*.sqlite*
+
+# Local environment and credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+*.py[cod]
+.DS_Store
+
+# Generated from the current source when needed.
+docs/codemap/

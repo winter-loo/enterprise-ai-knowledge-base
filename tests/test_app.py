@@ -12,7 +12,7 @@ def client(monkeypatch):
     monkeypatch.setattr(postgres_store, "list_kbs", lambda: [{"id": "company", "name": "公司知识库"}])
     monkeypatch.setattr(postgres_store, "list_projects", lambda kb_id: [{"id": "p-1", "kb_id": kb_id, "name": "研发项目"}])
     monkeypatch.setattr(postgres_store, "list_documents", lambda kb_id: [{"id": "doc-1", "filename": "guide.md", "project_id": "p-1", "department": "engineering", "status": "READY", "chunk_count": 1, "source_type": "upload"}])
-    monkeypatch.setattr(postgres_store, "insert_document", lambda **kw: {"id": kw["document_id"], "filename": kw["filename"], "project_id": kw["project_id"], "status": "READY", "chunk_count": len(kw["chunks"]), "parser": kw["parser"], "pdf_type": None, "pages_needing_ocr": []})
+    monkeypatch.setattr(postgres_store, "insert_document", lambda **kw: {"id": kw["document_id"], "filename": kw["filename"], "project_id": kw["project_id"], "status": "READY", "chunk_count": len(kw["chunks"]), "chunking_strategy": kw.get("chunking_strategy", "recursive"), "parser": kw["parser"], "pdf_type": None, "pages_needing_ocr": []})
     monkeypatch.setattr(postgres_store, "search", lambda question, kb_id, project_id, department, top_k: [{"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "content": "重启服务前先保存配置。", "score": 0.9}])
     messages = []
     monkeypatch.setattr(postgres_store, "add_message", lambda session_id, role, content: messages.append({"session_id": session_id, "role": role, "content": content}))
@@ -34,9 +34,10 @@ async def test_scope_lists_and_upload(client, monkeypatch):
         assert (await http.get("/api/knowledge-bases")).json()[0]["id"] == "company"
         assert (await http.get("/api/projects?kb_id=company")).json()[0]["id"] == "p-1"
         assert (await http.get("/api/documents?kb_id=company")).json()[0]["project_id"] == "p-1"
-        response = await http.post("/api/documents/upload", files={"file": ("guide.md", b"x", "text/markdown")}, data={"kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        response = await http.post("/api/documents/upload", files={"file": ("guide.md", b"x", "text/markdown")}, data={"kb_id": "company", "project_id": "p-1", "department": "engineering", "chunking_strategy": "fixed"})
     assert response.status_code == 200
     assert response.json()["project_id"] == "p-1"
+    assert response.json()["chunking_strategy"] == "fixed"
 
 
 @pytest.mark.anyio

@@ -6,7 +6,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, cast
+from typing import Any, AsyncIterator, Literal, cast
 
 import anydoc
 import httpx
@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app import postgres_store
+from app.chunking import chunk_text
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
@@ -54,6 +55,7 @@ class DocumentImport(BaseModel):
     kb_id: str = "company"
     project_id: str = "default"
     department: str = "general"
+    chunking_strategy: Literal["fixed", "recursive", "semantic", "paragraph"] = "recursive"
 
 
 class ChatCompletion(BaseModel):
@@ -105,19 +107,16 @@ def parse_document(filename: str, data: bytes) -> tuple[str, str, str | None, li
 
 
 def split_text(text: str, size: int = 700, overlap: int = 100) -> list[str]:
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    chunks, start = [], 0
-    while start < len(text):
-        end = min(len(text), start + size)
-        if end < len(text):
-            boundary = max(text.rfind("\n", start, end), text.rfind("。", start, end), text.rfind(".", start, end))
-            if boundary > start + size // 2:
-                end = boundary + 1
-        chunks.append(text[start:end].strip())
-        if end >= len(text):
-            break
-        start = max(start + 1, end - overlap)
-    return [chunk for chunk in chunks if chunk]
+    """Compatibility wrapper for the previous public helper; recursive is the new default."""
+    return chunk_text(text, strategy="recursive", size=size, overlap=overlap)
+
+
+def chunk_document(text: str, strategy: str) -> list[str]:
+    return chunk_text(
+        text,
+        strategy=strategy,
+        embedder=postgres_store.embed if strategy == "semantic" else None,
+    )
 
 
 def fallback_answer(sources: list[dict[str, Any]]) -> str:
@@ -219,7 +218,7 @@ def create_project(payload: dict[str, str]) -> dict[str, str]:
 
 
 @app.post("/api/documents/upload")
-async def upload_document(file: UploadFile = File(...), kb_id: str = Form("company"), project_id: str = Form("default"), department: str = Form("general")) -> dict[str, Any]:
+async def upload_document(file: UploadFile = File(...), kb_id: str = Form("company"), project_id: str = Form("default"), department: str = Form("general"), chunking_strategy: Literal["fixed", "recursive", "semantic", "paragraph"] = Form("recursive")) -> dict[str, Any]:
     ensure_kb(kb_id)
     project_id = ensure_project(kb_id, project_id)["id"]
     data = await file.read()
@@ -227,13 +226,13 @@ async def upload_document(file: UploadFile = File(...), kb_id: str = Form("compa
         raise HTTPException(413, "文件不能超过 10MB")
     filename = file.filename or "document.txt"
     text, parser, pdf_type, pages_needing_ocr = parse_document(filename, data)
-    chunks = split_text(text)
+    chunks = chunk_document(text, chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文件中没有可索引的文本")
     document_id = uuid.uuid4().hex
     stored_path = UPLOAD_DIR / f"{document_id}-{Path(filename).name}"
     stored_path.write_bytes(data)
-    return postgres_store.insert_document(kb_id=kb_id, project_id=project_id, document_id=document_id, filename=filename, department=department, parser=parser, pdf_type=pdf_type, pages_needing_ocr=pages_needing_ocr, chunks=chunks, stored_path=str(stored_path))
+    return postgres_store.insert_document(kb_id=kb_id, project_id=project_id, document_id=document_id, filename=filename, department=department, parser=parser, pdf_type=pdf_type, pages_needing_ocr=pages_needing_ocr, chunks=chunks, stored_path=str(stored_path), chunking_strategy=chunking_strategy)
 
 
 @app.get("/api/documents")
@@ -256,10 +255,10 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
 def import_document(payload: DocumentImport) -> dict[str, Any]:
     ensure_kb(payload.kb_id)
     project_id = ensure_project(payload.kb_id, payload.project_id)["id"]
-    chunks = split_text(payload.content)
+    chunks = chunk_document(payload.content, payload.chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文档内容不能为空")
-    return postgres_store.insert_document(kb_id=payload.kb_id, project_id=project_id, document_id=uuid.uuid4().hex, filename=payload.title, department=payload.department, parser="plain-text", pdf_type=None, pages_needing_ocr=[], chunks=chunks, stored_path="")
+    return postgres_store.insert_document(kb_id=payload.kb_id, project_id=project_id, document_id=uuid.uuid4().hex, filename=payload.title, department=payload.department, parser="plain-text", pdf_type=None, pages_needing_ocr=[], chunks=chunks, stored_path="", chunking_strategy=payload.chunking_strategy)
 
 
 @app.post("/api/v1/chat/completions")

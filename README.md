@@ -5,6 +5,7 @@
 - AnyDoc / pdf-inspector 文档解析
 - PostgreSQL + pgvector 唯一存储路径
 - Qwen3 Embedding（1024 维）
+- LightRAG-inspired `fixed`、`recursive`、`semantic`、`paragraph` 多切片策略
 - 知识库内多个 Project
 - `kb_id + project_id + department/general` 召回前过滤
 - pgvector 语义分 + PostgreSQL 词法分 + freshness
@@ -48,7 +49,7 @@ GET    /api/v1/chat/history/{sessionId}
 DELETE /api/v1/chat/session/{sessionId}
 ```
 
-`document/import` 接收 `title`、`content`、`kb_id`、`project_id`、`department`。`chat/completions` 额外接收 `session_id`、`question`、`top_k`，以 SSE 返回 `sources`、`delta`、`done` 或 `error` JSON 事件。会话消息保存在 PostgreSQL `chat_messages`；生成时只读取最近 12 条，完整历史仍可查询和清除。
+`document/import` 接收 `title`、`content`、`kb_id`、`project_id`、`department` 和 `chunking_strategy`。上传接口同样支持 `chunking_strategy`：`fixed` 是重叠固定窗口，`recursive` 按段落/换行/标点递归拆分（默认），`semantic` 根据句向量相邻距离切换主题，`paragraph` 保留 Markdown 标题上下文。`chat/completions` 额外接收 `session_id`、`question`、`top_k`，以 SSE 返回 `sources`、`delta`、`done` 或 `error` JSON 事件。会话消息保存在 PostgreSQL `chat_messages`；生成时只读取最近 12 条，完整历史仍可查询和清除。
 
 Redis 没有加入：现有 PostgreSQL 已同时满足向量持久化和会话存储，任务书只将 Redis 标为推荐。
 

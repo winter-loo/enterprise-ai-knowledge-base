@@ -132,7 +132,7 @@ def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(str(float(value)) for value in vector) + "]"
 
 
-def insert_document(*, kb_id: str, project_id: str, document_id: str, filename: str, department: str, parser: str, pdf_type: str | None, pages_needing_ocr: list[int], chunks: list[str], stored_path: str) -> dict[str, Any]:
+def insert_document(*, kb_id: str, project_id: str, document_id: str, filename: str, department: str, parser: str, pdf_type: str | None, pages_needing_ocr: list[int], chunks: list[str], stored_path: str, chunking_strategy: str = "recursive") -> dict[str, Any]:
     vectors = embed(chunks)
     created = now()
     with connect() as conn:
@@ -141,9 +141,9 @@ def insert_document(*, kb_id: str, project_id: str, document_id: str, filename: 
                 INSERT INTO knowledge_evidence
                 (id,kb_id,project_id,document_id,chunk_index,content,summary,embedding,department,status,source_type,source_uri,filename,page,metadata,created_at)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,'READY','upload',%s,%s,NULL,%s::jsonb,%s)
-            """, (uuid.uuid4().hex, kb_id, project_id, document_id, index, content, content[:500], vector_literal(vector), department, stored_path, filename, json.dumps({"parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr}), created))
+            """, (uuid.uuid4().hex, kb_id, project_id, document_id, index, content, content[:500], vector_literal(vector), department, stored_path, filename, json.dumps({"parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr, "chunking_strategy": chunking_strategy}), created))
         conn.commit()
-    return {"id": document_id, "filename": filename, "project_id": project_id, "status": "READY", "chunk_count": len(chunks), "parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr}
+    return {"id": document_id, "filename": filename, "project_id": project_id, "status": "READY", "chunk_count": len(chunks), "chunking_strategy": chunking_strategy, "parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr}
 
 
 def list_documents(kb_id: str) -> list[dict[str, Any]]:
@@ -152,7 +152,8 @@ def list_documents(kb_id: str) -> list[dict[str, Any]]:
             SELECT document_id AS id, max(filename) AS filename, max(project_id) AS project_id,
                    max(department) AS department, max(status) AS status, count(*) AS chunk_count,
                    max(source_type) AS source_type, max(metadata->>'parser') AS parser,
-                   max(metadata->>'pdf_type') AS pdf_type, max(created_at) AS created_at
+                   max(metadata->>'pdf_type') AS pdf_type, max(metadata->>'chunking_strategy') AS chunking_strategy,
+                   max(created_at) AS created_at
             FROM knowledge_evidence WHERE kb_id=%s GROUP BY document_id ORDER BY max(created_at) DESC
         """, (kb_id,)).fetchall()
 

@@ -6,13 +6,13 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import anydoc
 import httpx
 import pdf_inspector
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -46,6 +46,23 @@ class AskRequest(BaseModel):
     department: str = "general"
     top_k: int = Field(default=5, ge=1, le=10)
     history: list[dict[str, str]] = Field(default_factory=list)
+
+
+class DocumentImport(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1)
+    kb_id: str = "company"
+    project_id: str = "default"
+    department: str = "general"
+
+
+class ChatCompletion(BaseModel):
+    session_id: str = Field(min_length=1, max_length=200)
+    question: str = Field(min_length=1, max_length=2000)
+    kb_id: str = "company"
+    project_id: str = "default"
+    department: str = "general"
+    top_k: int = Field(default=5, ge=1, le=10)
 
 
 def ensure_kb(kb_id: str) -> dict[str, Any]:
@@ -129,6 +146,44 @@ async def llm_answer(question: str, sources: list[dict[str, Any]], history: list
         return fallback_answer(sources), "local-fallback-after-llm-error"
 
 
+def stream_content(payload: dict[str, Any]) -> str:
+    if payload.get("type") == "response.output_text.delta":
+        return payload.get("delta", "")
+    choices = payload.get("choices") or []
+    return choices[0].get("delta", {}).get("content", "") if choices else ""
+
+
+async def chat_stream(payload: ChatCompletion, sources: list[dict[str, Any]], history: list[dict[str, str]]) -> AsyncIterator[str]:
+    yield f"data: {json.dumps({'type': 'sources', 'sources': [{'filename': s['filename'], 'chunk_index': s['chunk_index'], 'score': s['score']} for s in sources]}, ensure_ascii=False)}\n\n"
+    base_url, api_key, model = os.getenv("LLM_BASE_URL", "").rstrip("/"), os.getenv("LLM_API_KEY", ""), os.getenv("LLM_MODEL", "gpt-4o-mini")
+    if not base_url or not api_key:
+        yield f"data: {json.dumps({'type': 'error', 'message': 'LLM configuration is required'}, ensure_ascii=False)}\n\n"
+        return
+    context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
+    messages = [{"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号。"}, *history[-12:], {"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"}]
+    answer = ""
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            async with client.stream("POST", f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1, "stream": True}) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                        continue
+                    try:
+                        delta = stream_content(json.loads(line[5:].strip()))
+                    except json.JSONDecodeError:
+                        continue
+                    if delta:
+                        answer += delta
+                        yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
+        if not answer:
+            raise RuntimeError("LLM stream returned no content")
+        postgres_store.add_message(payload.session_id, "assistant", answer)
+        yield 'data: {"type":"done"}\n\n'
+    except (httpx.HTTPError, RuntimeError) as exc:
+        yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -194,3 +249,33 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
     answer, answer_mode = await llm_answer(payload.question, sources, payload.history)
     citations = [{"id": source["id"], "filename": source["filename"], "chunk_index": source["chunk_index"], "score": source["score"], "excerpt": re.sub(r"\s+", " ", source["content"])[:300]} for source in sources]
     return {"answer": answer, "answer_mode": answer_mode, "citations": citations, "retrieved": len(citations)}
+
+
+@app.post("/api/v1/document/import")
+def import_document(payload: DocumentImport) -> dict[str, Any]:
+    ensure_kb(payload.kb_id)
+    project_id = ensure_project(payload.kb_id, payload.project_id)["id"]
+    chunks = split_text(payload.content)
+    if not chunks:
+        raise HTTPException(422, "文档内容不能为空")
+    return postgres_store.insert_document(kb_id=payload.kb_id, project_id=project_id, document_id=uuid.uuid4().hex, filename=payload.title, department=payload.department, parser="plain-text", pdf_type=None, pages_needing_ocr=[], chunks=chunks, stored_path="")
+
+
+@app.post("/api/v1/chat/completions")
+def chat_completions(payload: ChatCompletion) -> StreamingResponse:
+    ensure_kb(payload.kb_id)
+    project_id = ensure_project(payload.kb_id, payload.project_id)["id"]
+    history = [dict(row) for row in postgres_store.list_messages(payload.session_id, 12)]
+    sources = postgres_store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
+    postgres_store.add_message(payload.session_id, "user", payload.question)
+    return StreamingResponse(chat_stream(payload, sources, history), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/v1/chat/history/{session_id}")
+def chat_history(session_id: str) -> dict[str, Any]:
+    return {"session_id": session_id, "messages": [dict(row) for row in postgres_store.list_messages(session_id)]}
+
+
+@app.delete("/api/v1/chat/session/{session_id}")
+def clear_chat_session(session_id: str) -> dict[str, Any]:
+    return {"session_id": session_id, "deleted": postgres_store.clear_session(session_id)}

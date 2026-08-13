@@ -40,7 +40,17 @@ POST /api/projects
 POST /api/documents/upload
 GET  /api/documents?kb_id=company
 POST /api/ask
+
+# 任务书要求的兼容接口
+POST   /api/v1/document/import
+POST   /api/v1/chat/completions
+GET    /api/v1/chat/history/{sessionId}
+DELETE /api/v1/chat/session/{sessionId}
 ```
+
+`document/import` 接收 `title`、`content`、`kb_id`、`project_id`、`department`。`chat/completions` 额外接收 `session_id`、`question`、`top_k`，以 SSE 返回 `sources`、`delta`、`done` 或 `error` JSON 事件。会话消息保存在 PostgreSQL `chat_messages`；生成时只读取最近 12 条，完整历史仍可查询和清除。
+
+Redis 没有加入：现有 PostgreSQL 已同时满足向量持久化和会话存储，任务书只将 Redis 标为推荐。
 
 上传和问答必须带同一个 `kb_id`、`project_id` 和可信身份推导出的 `department`。当前页面中的部门仍是演示输入，不是真实 SSO/RBAC。
 

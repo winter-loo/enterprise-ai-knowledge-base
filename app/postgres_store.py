@@ -43,8 +43,13 @@ def init_db() -> None:
                 source_type TEXT NOT NULL DEFAULT 'upload', source_uri TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
                 page INTEGER, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                content TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_evidence_scope ON knowledge_evidence(kb_id, project_id, department, status);
             CREATE INDEX IF NOT EXISTS idx_evidence_fts ON knowledge_evidence USING GIN (to_tsvector('simple', content));
+            CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_messages(session_id, id);
         """)
         dimensions = conn.execute("""
             SELECT atttypmod FROM pg_attribute
@@ -160,3 +165,26 @@ def search(question: str, kb_id: str, project_id: str, department: str, top_k: i
             FROM candidates WHERE semantic_score > 0 OR lexical_score > 0
             ORDER BY score DESC LIMIT %s
         """, (query_vector, question, kb_id, project_id, department, top_k)).fetchall()
+
+
+def add_message(session_id: str, role: str, content: str) -> None:
+    with connect() as conn:
+        conn.execute("INSERT INTO chat_messages(session_id,role,content,created_at) VALUES(%s,%s,%s,%s)", (session_id, role, content, now()))
+        conn.commit()
+
+
+def list_messages(session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+    with connect() as conn:
+        if limit:
+            return conn.execute(
+                "SELECT role,content,created_at FROM (SELECT * FROM chat_messages WHERE session_id=%s ORDER BY id DESC LIMIT %s) m ORDER BY id",
+                (session_id, limit),
+            ).fetchall()
+        return conn.execute("SELECT role,content,created_at FROM chat_messages WHERE session_id=%s ORDER BY id", (session_id,)).fetchall()
+
+
+def clear_session(session_id: str) -> int:
+    with connect() as conn:
+        deleted = conn.execute("DELETE FROM chat_messages WHERE session_id=%s", (session_id,)).rowcount
+        conn.commit()
+        return deleted

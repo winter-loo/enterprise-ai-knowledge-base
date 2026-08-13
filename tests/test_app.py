@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from app import postgres_store
-from app.main import app, split_text
+from app.main import app, split_text, stream_content
 
 
 @pytest.fixture
@@ -14,6 +14,10 @@ def client(monkeypatch):
     monkeypatch.setattr(postgres_store, "list_documents", lambda kb_id: [{"id": "doc-1", "filename": "guide.md", "project_id": "p-1", "department": "engineering", "status": "READY", "chunk_count": 1, "source_type": "upload"}])
     monkeypatch.setattr(postgres_store, "insert_document", lambda **kw: {"id": kw["document_id"], "filename": kw["filename"], "project_id": kw["project_id"], "status": "READY", "chunk_count": len(kw["chunks"]), "parser": kw["parser"], "pdf_type": None, "pages_needing_ocr": []})
     monkeypatch.setattr(postgres_store, "search", lambda question, kb_id, project_id, department, top_k: [{"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "content": "重启服务前先保存配置。", "score": 0.9}])
+    messages = []
+    monkeypatch.setattr(postgres_store, "add_message", lambda session_id, role, content: messages.append({"session_id": session_id, "role": role, "content": content}))
+    monkeypatch.setattr(postgres_store, "list_messages", lambda session_id, limit=None: [m for m in messages if m["session_id"] == session_id][-limit if limit else None:])
+    monkeypatch.setattr(postgres_store, "clear_session", lambda session_id: sum(m["session_id"] == session_id for m in messages))
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
@@ -75,3 +79,29 @@ def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
     monkeypatch.setattr(postgres_store, "connect", Connection)
     postgres_store.search("年假审批需要哪些材料？", "company", "p-1", "hr", 5)
     assert embedded == [f"Instruct: {postgres_store.QUERY_INSTRUCTION}\nQuery: 年假审批需要哪些材料？"]
+
+
+def test_stream_content_accepts_both_openai_dialects():
+    assert stream_content({"choices": [{"delta": {"content": "传统"}}]}) == "传统"
+    assert stream_content({"type": "response.output_text.delta", "delta": "响应"}) == "响应"
+
+
+@pytest.mark.anyio
+async def test_taskbook_import_history_stream_and_clear(client, monkeypatch):
+    async def stream(*_):
+        yield 'data: {"type":"delta","content":"请先保存配置。"}\n\n'
+        yield 'data: {"type":"done"}\n\n'
+
+    monkeypatch.setattr("app.main.chat_stream", stream)
+    async with client as http:
+        imported = await http.post("/api/v1/document/import", json={"title": "guide.md", "content": "部署步骤。", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        response = await http.post("/api/v1/chat/completions", json={"session_id": "s-1", "question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        history = await http.get("/api/v1/chat/history/s-1")
+        cleared = await http.delete("/api/v1/chat/session/s-1")
+    assert imported.status_code == 200
+    assert imported.json()["status"] == "READY"
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"type":"delta"' in response.text
+    assert history.status_code == 200
+    assert cleared.json()["deleted"] == 1

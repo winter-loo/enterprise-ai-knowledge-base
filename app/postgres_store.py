@@ -152,17 +152,34 @@ def search(question: str, kb_id: str, project_id: str, department: str, top_k: i
     query_vector = vector_literal(embed([instructed])[0])
     with connect() as conn:
         return conn.execute("""
+            -- 候选集只包含当前知识库和 Project 中，当前部门可见（本部门或 general）
+            -- 且已完成索引的片段。权限过滤发生在评分前，避免越权片段进入召回结果。
             WITH candidates AS (
-                SELECT e.*, 1 - (e.embedding <=> %s::vector) AS semantic_score,
+                SELECT e.*,
+                       -- pgvector 的 <=> 返回余弦距离：cosine_distance = 1 - cosine_similarity。
+                       -- 因此 1 - distance 还原为 cosine similarity。越接近 1，向量语义越相似；
+                       -- 0 表示正交，负数表示方向相反。query_vector 是问题经 Qwen 检索指令编码后的向量。
+                       1 - (e.embedding <=> %s::vector) AS semantic_score,
+                       -- 将片段和问题转换为 PostgreSQL simple 配置的 tsvector/tsquery，
+                       -- ts_rank 根据命中词及其位置计算词法相关性；命中越充分，分数通常越高。
                        ts_rank(to_tsvector('simple', e.content), websearch_to_tsquery('simple', %s)) AS lexical_score,
+                       -- 片段创建至今的天数，供下面的新鲜度衰减项使用。
                        EXTRACT(EPOCH FROM (now() - e.created_at)) / 86400 AS age_days
                 FROM knowledge_evidence e
                 WHERE e.kb_id=%s AND e.project_id=%s
                   AND (e.department=%s OR e.department='general') AND e.status='READY'
             )
-            SELECT candidates.*, (0.75 * semantic_score + 0.25 * lexical_score +
-                0.1 / (1 + age_days / 30))::double precision AS score
+            SELECT candidates.*,
+                   -- 最终分数 = 75% 语义相似度 + 25% 词法相关性 + 新鲜度奖励。
+                   -- 新鲜度项为 0.1/(1+age_days/30)：当天约 0.1，30 天约 0.05，
+                   -- 90 天约 0.025，只用于同等相关内容的轻量排序，不应压过相关性。
+                   -- 0.75/0.25 是当前 MVP 的经验权重，不代表经过离线评测调优；
+                   -- semantic_score 与 ts_rank 也并非天然处于完全相同的标度。
+                   (0.75 * semantic_score + 0.25 * lexical_score +
+                    0.1 / (1 + age_days / 30))::double precision AS score
+            -- 至少保留语义正相关或有词法命中的片段，排除两个信号都无效的结果。
             FROM candidates WHERE semantic_score > 0 OR lexical_score > 0
+            -- 按混合分降序，只返回调用方要求的 top_k 个片段。
             ORDER BY score DESC LIMIT %s
         """, (query_vector, question, kb_id, project_id, department, top_k)).fetchall()
 

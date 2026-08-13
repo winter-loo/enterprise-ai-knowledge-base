@@ -175,7 +175,9 @@ def test_summarize_chunks_uses_configured_llm(monkeypatch):
     def handler(request):
         assert request.url == "http://llm.test/v1/chat/completions"
         assert request.headers["authorization"] == "Bearer secret"
-        assert request.read().find(b'"model":"summary-model"') >= 0
+        request_body = request.read()
+        assert request_body.find(b'"model":"summary-model"') >= 0
+        assert "摘要必须保持原文语言，不要翻译" in request_body.decode()
         return httpx.Response(200, json={"choices": [{"message": {"content": "  部署前保存配置。  "}}]})
 
     transport = httpx.MockTransport(handler)

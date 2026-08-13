@@ -34,7 +34,8 @@ def _recursive(text: str, size: int, overlap: int) -> list[str]:
         if len(pieces) == 1:
             return split(part, level + 1)
         units = [piece + (separator if index < len(pieces) - 1 else "") for index, piece in enumerate(pieces)]
-        chunks, current = [], ""
+        chunks: list[str] = []
+        current = ""
         for unit in units:
             if len(unit) > size:
                 if current.strip():
@@ -61,7 +62,8 @@ def _recursive(text: str, size: int, overlap: int) -> list[str]:
 
 
 def _sentences(text: str) -> list[str]:
-    return [part.strip() for part in re.findall(r"[^。！？.!?]+[。！？.!?]*", text, re.S) if part.strip()]
+    matches = re.finditer(r"[^。！？.!?]+[。！？.!?]*", text, re.DOTALL)
+    return [match.group().strip() for match in matches if match.group().strip()]
 
 
 def _cosine_distance(left: list[float], right: list[float]) -> float:
@@ -88,7 +90,8 @@ def _semantic(text: str, size: int, embedder: Embedder, percentile: float) -> li
         raise ValueError("embedder must return one vector per sentence")
     distances = [_cosine_distance(vectors[index], vectors[index + 1]) for index in range(len(vectors) - 1)]
     threshold = _percentile(distances, percentile)
-    groups, current = [], sentences[0]
+    groups: list[str] = []
+    current = sentences[0]
     for index, sentence in enumerate(sentences[1:]):
         if distances[index] >= threshold and current:
             groups.append(current)

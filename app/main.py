@@ -4,9 +4,10 @@ import json
 import os
 import re
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal, cast
+from typing import Annotated, Literal, TypedDict, cast
 
 import anydoc
 import httpx
@@ -14,10 +15,45 @@ import pdf_inspector
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from psycopg.rows import DictRow
 from pydantic import BaseModel, Field
 
 from app import postgres_store
 from app.chunking import chunk_text
+
+JsonObject = dict[str, object]
+
+
+class ChatMessage(TypedDict):
+    role: str
+    content: str
+
+
+class ChatChoiceDelta(TypedDict, total=False):
+    content: str
+
+
+class ChatChoice(TypedDict):
+    delta: ChatChoiceDelta
+
+
+class StreamPayload(TypedDict, total=False):
+    type: str
+    delta: str
+    choices: list[ChatChoice]
+
+
+class CompletionMessage(TypedDict):
+    content: str
+
+
+class CompletionChoice(TypedDict):
+    message: CompletionMessage
+
+
+class CompletionPayload(TypedDict):
+    choices: list[CompletionChoice]
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
@@ -67,14 +103,14 @@ class ChatCompletion(BaseModel):
     top_k: int = Field(default=5, ge=1, le=10)
 
 
-def ensure_kb(kb_id: str) -> dict[str, Any]:
+def ensure_kb(kb_id: str) -> DictRow:
     row = postgres_store.ensure_kb(kb_id)
     if not row:
         raise HTTPException(404, "知识库不存在")
     return row
 
 
-def ensure_project(kb_id: str, project_id: str) -> dict[str, Any]:
+def ensure_project(kb_id: str, project_id: str) -> DictRow:
     row = postgres_store.ensure_project(kb_id, project_id)
     if not row:
         raise HTTPException(404, "项目范围不存在")
@@ -119,14 +155,18 @@ def chunk_document(text: str, strategy: str) -> list[str]:
     )
 
 
-def fallback_answer(sources: list[dict[str, Any]]) -> str:
+def row_string(row: DictRow, key: str) -> str:
+    return cast(str, row[key])
+
+
+def fallback_answer(sources: list[DictRow]) -> str:
     if not sources:
         return "知识库中没有找到足够相关的资料，无法基于现有文档可靠回答。"
-    excerpts = [re.sub(r"\s+", " ", source["content"]).strip()[:260] for source in sources[:3]]
+    excerpts = [re.sub(r"\s+", " ", row_string(source, "content")).strip()[:260] for source in sources[:3]]
     return "根据知识库中检索到的资料：\n" + "\n".join(f"- {text}" for text in excerpts)
 
 
-async def llm_answer(question: str, sources: list[dict[str, Any]], history: list[dict[str, str]]) -> tuple[str, str]:
+async def llm_answer(question: str, sources: list[DictRow], history: list[dict[str, str]]) -> tuple[str, str]:
     base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
     api_key = os.getenv("LLM_API_KEY", "")
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -139,21 +179,21 @@ async def llm_answer(question: str, sources: list[dict[str, Any]], history: list
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1})
-            response.raise_for_status()
-            payload = response.json()
+            _ = response.raise_for_status()
+            payload = cast(CompletionPayload, response.json())
             return payload["choices"][0]["message"]["content"], model
     except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError):
         return fallback_answer(sources), "local-fallback-after-llm-error"
 
 
-def stream_content(payload: dict[str, Any]) -> str:
+def stream_content(payload: StreamPayload) -> str:
     if payload.get("type") == "response.output_text.delta":
         return payload.get("delta", "")
-    choices = payload.get("choices") or []
+    choices = payload.get("choices", [])
     return choices[0].get("delta", {}).get("content", "") if choices else ""
 
 
-async def chat_stream(payload: ChatCompletion, sources: list[dict[str, Any]], history: list[dict[str, str]]) -> AsyncIterator[str]:
+async def chat_stream(payload: ChatCompletion, sources: list[DictRow], history: list[dict[str, str]]) -> AsyncIterator[str]:
     yield f"data: {json.dumps({'type': 'sources', 'sources': [{'filename': s['filename'], 'chunk_index': s['chunk_index'], 'score': s['score']} for s in sources]}, ensure_ascii=False)}\n\n"
     base_url, api_key, model = os.getenv("LLM_BASE_URL", "").rstrip("/"), os.getenv("LLM_API_KEY", ""), os.getenv("LLM_MODEL", "gpt-4o-mini")
     if not base_url or not api_key:
@@ -163,14 +203,13 @@ async def chat_stream(payload: ChatCompletion, sources: list[dict[str, Any]], hi
     messages = [{"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号。"}, *history[-12:], {"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"}]
     answer = ""
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            async with client.stream("POST", f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1, "stream": True}) as response:
-                response.raise_for_status()
+        async with httpx.AsyncClient(timeout=90) as client, client.stream("POST", f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1, "stream": True}) as response:
+                _ = response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.startswith("data:") or line[5:].strip() == "[DONE]":
                         continue
                     try:
-                        delta = stream_content(json.loads(line[5:].strip()))
+                        delta = stream_content(cast(StreamPayload, json.loads(line[5:].strip())))
                     except json.JSONDecodeError:
                         continue
                     if delta:
@@ -195,32 +234,38 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/knowledge-bases")
-def list_kbs() -> list[dict[str, Any]]:
+def list_kbs() -> list[JsonObject]:
     return [dict(row) for row in postgres_store.list_kbs()]
 
 
 @app.post("/api/knowledge-bases")
-def create_kb(payload: KnowledgeBaseCreate) -> dict[str, Any]:
+def create_kb(payload: KnowledgeBaseCreate) -> dict[str, str]:
     return postgres_store.create_kb(payload.name, payload.description)
 
 
 @app.get("/api/projects")
-def list_projects(kb_id: str = "company") -> list[dict[str, Any]]:
-    ensure_kb(kb_id)
+def list_projects(kb_id: str = "company") -> list[JsonObject]:
+    _ = ensure_kb(kb_id)
     return [dict(row) for row in postgres_store.list_projects(kb_id)]
 
 
 @app.post("/api/projects")
 def create_project(payload: dict[str, str]) -> dict[str, str]:
     kb_id = payload.get("kb_id", "company")
-    ensure_kb(kb_id)
+    _ = ensure_kb(kb_id)
     return postgres_store.create_project(kb_id, payload["name"], payload.get("description", ""))
 
 
 @app.post("/api/documents/upload")
-async def upload_document(file: UploadFile = File(...), kb_id: str = Form("company"), project_id: str = Form("default"), department: str = Form("general"), chunking_strategy: Literal["fixed", "recursive", "semantic", "paragraph"] = Form("recursive")) -> dict[str, Any]:
-    ensure_kb(kb_id)
-    project_id = ensure_project(kb_id, project_id)["id"]
+async def upload_document(
+    file: Annotated[UploadFile, File()],
+    kb_id: Annotated[str, Form()] = "company",
+    project_id: Annotated[str, Form()] = "default",
+    department: Annotated[str, Form()] = "general",
+    chunking_strategy: Annotated[Literal["fixed", "recursive", "semantic", "paragraph"], Form()] = "recursive",
+) -> JsonObject:
+    _ = ensure_kb(kb_id)
+    project_id = row_string(ensure_project(kb_id, project_id), "id")
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件不能超过 10MB")
@@ -231,30 +276,30 @@ async def upload_document(file: UploadFile = File(...), kb_id: str = Form("compa
         raise HTTPException(422, "文件中没有可索引的文本")
     document_id = uuid.uuid4().hex
     stored_path = UPLOAD_DIR / f"{document_id}-{Path(filename).name}"
-    stored_path.write_bytes(data)
+    _ = stored_path.write_bytes(data)
     return postgres_store.insert_document(kb_id=kb_id, project_id=project_id, document_id=document_id, filename=filename, department=department, parser=parser, pdf_type=pdf_type, pages_needing_ocr=pages_needing_ocr, chunks=chunks, stored_path=str(stored_path), chunking_strategy=chunking_strategy)
 
 
 @app.get("/api/documents")
-def list_documents(kb_id: str = "company") -> list[dict[str, Any]]:
-    ensure_kb(kb_id)
+def list_documents(kb_id: str = "company") -> list[JsonObject]:
+    _ = ensure_kb(kb_id)
     return [dict(row) for row in postgres_store.list_documents(kb_id)]
 
 
 @app.post("/api/ask")
-async def ask(payload: AskRequest) -> dict[str, Any]:
-    ensure_kb(payload.kb_id)
-    project_id = ensure_project(payload.kb_id, payload.project_id)["id"]
+async def ask(payload: AskRequest) -> JsonObject:
+    _ = ensure_kb(payload.kb_id)
+    project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
     sources = postgres_store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
     answer, answer_mode = await llm_answer(payload.question, sources, payload.history)
-    citations = [{"id": source["id"], "filename": source["filename"], "chunk_index": source["chunk_index"], "score": source["score"], "excerpt": re.sub(r"\s+", " ", source["content"])[:300]} for source in sources]
+    citations = [{"id": source["id"], "filename": source["filename"], "chunk_index": source["chunk_index"], "score": source["score"], "excerpt": re.sub(r"\s+", " ", row_string(source, "content"))[:300]} for source in sources]
     return {"answer": answer, "answer_mode": answer_mode, "citations": citations, "retrieved": len(citations)}
 
 
 @app.post("/api/v1/document/import")
-def import_document(payload: DocumentImport) -> dict[str, Any]:
-    ensure_kb(payload.kb_id)
-    project_id = ensure_project(payload.kb_id, payload.project_id)["id"]
+def import_document(payload: DocumentImport) -> JsonObject:
+    _ = ensure_kb(payload.kb_id)
+    project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
     chunks = chunk_document(payload.content, payload.chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文档内容不能为空")
@@ -263,19 +308,19 @@ def import_document(payload: DocumentImport) -> dict[str, Any]:
 
 @app.post("/api/v1/chat/completions")
 def chat_completions(payload: ChatCompletion) -> StreamingResponse:
-    ensure_kb(payload.kb_id)
-    project_id = ensure_project(payload.kb_id, payload.project_id)["id"]
-    history = [dict(row) for row in postgres_store.list_messages(payload.session_id, 12)]
+    _ = ensure_kb(payload.kb_id)
+    project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
+    history = cast(list[dict[str, str]], postgres_store.list_messages(payload.session_id, 12))
     sources = postgres_store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
     postgres_store.add_message(payload.session_id, "user", payload.question)
     return StreamingResponse(chat_stream(payload, sources, history), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/v1/chat/history/{session_id}")
-def chat_history(session_id: str) -> dict[str, Any]:
+def chat_history(session_id: str) -> JsonObject:
     return {"session_id": session_id, "messages": [dict(row) for row in postgres_store.list_messages(session_id)]}
 
 
 @app.delete("/api/v1/chat/session/{session_id}")
-def clear_chat_session(session_id: str) -> dict[str, Any]:
+def clear_chat_session(session_id: str) -> JsonObject:
     return {"session_id": session_id, "deleted": postgres_store.clear_session(session_id)}

@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime, timezone
-from typing import Any, cast
+from datetime import UTC, datetime
+from typing import TypedDict, cast
 
 import httpx
 import psycopg
@@ -15,24 +15,29 @@ EMBEDDING_DIMENSIONS = 1024
 QUERY_INSTRUCTION = "Given a user question about internal enterprise knowledge, retrieve relevant passages that answer the question"
 
 
+class EmbeddingData(TypedDict):
+    embedding: list[float]
+
+
+class EmbeddingResponse(TypedDict):
+    data: list[EmbeddingData]
+
+
 def connect() -> psycopg.Connection[DictRow]:
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
-    return cast(
-        psycopg.Connection[DictRow],
-        psycopg.connect(database_url, row_factory=cast(Any, dict_row)),
-    )
+    return psycopg.Connection[DictRow].connect(database_url, row_factory=dict_row)
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def init_db() -> None:
     with connect() as conn:
-        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        conn.execute("""
+        _ = conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        _ = conn.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_bases (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL
             );
@@ -61,26 +66,26 @@ def init_db() -> None:
         """).fetchone()
         if dimension_row is None:
             raise RuntimeError("knowledge_evidence.embedding column was not created")
-        dimensions = dimension_row["atttypmod"]
+        dimensions = cast(int, dimension_row["atttypmod"])
         if dimensions != EMBEDDING_DIMENSIONS:
             count_row = conn.execute("SELECT count(*) AS count FROM knowledge_evidence").fetchone()
             if count_row is None:
                 raise RuntimeError("could not count knowledge_evidence rows")
-            count = count_row["count"]
+            count = cast(int, count_row["count"])
             if count:
                 raise RuntimeError(f"knowledge_evidence contains {count} incompatible vectors; clear it and restart")
-            conn.execute(SQL("ALTER TABLE knowledge_evidence ALTER COLUMN embedding TYPE vector(1024)"))
-        conn.execute("INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("company", "公司知识库", "默认企业政策、产品和技术文档", now()))
-        conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("default", "company", "默认项目", "默认项目范围", now()))
+            _ = conn.execute(SQL("ALTER TABLE knowledge_evidence ALTER COLUMN embedding TYPE vector(1024)"))
+        _ = conn.execute("INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("company", "公司知识库", "默认企业政策、产品和技术文档", now()))
+        _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("default", "company", "默认项目", "默认项目范围", now()))
         conn.commit()
 
 
-def ensure_kb(kb_id: str) -> dict[str, Any] | None:
+def ensure_kb(kb_id: str) -> DictRow | None:
     with connect() as conn:
         return conn.execute("SELECT * FROM knowledge_bases WHERE id=%s", (kb_id,)).fetchone()
 
 
-def ensure_project(kb_id: str, project_id: str) -> dict[str, Any] | None:
+def ensure_project(kb_id: str, project_id: str) -> DictRow | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM projects WHERE kb_id=%s AND id=%s", (kb_id, project_id)).fetchone()
         if not row and project_id == "default":
@@ -88,21 +93,21 @@ def ensure_project(kb_id: str, project_id: str) -> dict[str, Any] | None:
         return row
 
 
-def list_kbs() -> list[dict[str, Any]]:
+def list_kbs() -> list[DictRow]:
     with connect() as conn:
         return conn.execute("SELECT * FROM knowledge_bases ORDER BY created_at").fetchall()
 
 
-def create_kb(name: str, description: str) -> dict[str, Any]:
+def create_kb(name: str, description: str) -> dict[str, str]:
     kb_id, project_id = uuid.uuid4().hex[:12], uuid.uuid4().hex[:12]
     with connect() as conn:
-        conn.execute("INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s)", (kb_id, name, description, now()))
-        conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s)", (project_id, kb_id, "默认项目", "默认项目范围", now()))
+        _ = conn.execute("INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s)", (kb_id, name, description, now()))
+        _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s)", (project_id, kb_id, "默认项目", "默认项目范围", now()))
         conn.commit()
     return {"id": kb_id, "name": name, "description": description, "default_project_id": project_id}
 
 
-def list_projects(kb_id: str) -> list[dict[str, Any]]:
+def list_projects(kb_id: str) -> list[DictRow]:
     with connect() as conn:
         return conn.execute("SELECT * FROM projects WHERE kb_id=%s ORDER BY created_at", (kb_id,)).fetchall()
 
@@ -110,7 +115,7 @@ def list_projects(kb_id: str) -> list[dict[str, Any]]:
 def create_project(kb_id: str, name: str, description: str) -> dict[str, str]:
     project_id = uuid.uuid4().hex[:12]
     with connect() as conn:
-        conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s)", (project_id, kb_id, name, description, now()))
+        _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s)", (project_id, kb_id, name, description, now()))
         conn.commit()
     return {"id": project_id, "name": name}
 
@@ -121,8 +126,9 @@ def embed(texts: list[str]) -> list[list[float]]:
     model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
     with httpx.Client(timeout=120) as client:
         response = client.post(f"{base_url}/embeddings", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "input": texts})
-        response.raise_for_status()
-        vectors = [item["embedding"] for item in response.json()["data"]]
+        _ = response.raise_for_status()
+        payload = cast(EmbeddingResponse, response.json())
+        vectors = [item["embedding"] for item in payload["data"]]
     if len(vectors) != len(texts) or any(len(vector) != EMBEDDING_DIMENSIONS for vector in vectors):
         raise RuntimeError(f"embedding service must return one {EMBEDDING_DIMENSIONS}-dimension vector per input")
     return vectors
@@ -132,12 +138,12 @@ def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(str(float(value)) for value in vector) + "]"
 
 
-def insert_document(*, kb_id: str, project_id: str, document_id: str, filename: str, department: str, parser: str, pdf_type: str | None, pages_needing_ocr: list[int], chunks: list[str], stored_path: str, chunking_strategy: str = "recursive") -> dict[str, Any]:
+def insert_document(*, kb_id: str, project_id: str, document_id: str, filename: str, department: str, parser: str, pdf_type: str | None, pages_needing_ocr: list[int], chunks: list[str], stored_path: str, chunking_strategy: str = "recursive") -> dict[str, object]:
     vectors = embed(chunks)
     created = now()
     with connect() as conn:
         for index, (content, vector) in enumerate(zip(chunks, vectors, strict=True)):
-            conn.execute("""
+            _ = conn.execute("""
                 INSERT INTO knowledge_evidence
                 (id,kb_id,project_id,document_id,chunk_index,content,summary,embedding,department,status,source_type,source_uri,filename,page,metadata,created_at)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,'READY','upload',%s,%s,NULL,%s::jsonb,%s)
@@ -146,7 +152,7 @@ def insert_document(*, kb_id: str, project_id: str, document_id: str, filename: 
     return {"id": document_id, "filename": filename, "project_id": project_id, "status": "READY", "chunk_count": len(chunks), "chunking_strategy": chunking_strategy, "parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr}
 
 
-def list_documents(kb_id: str) -> list[dict[str, Any]]:
+def list_documents(kb_id: str) -> list[DictRow]:
     with connect() as conn:
         return conn.execute("""
             SELECT document_id AS id, max(filename) AS filename, max(project_id) AS project_id,
@@ -158,7 +164,7 @@ def list_documents(kb_id: str) -> list[dict[str, Any]]:
         """, (kb_id,)).fetchall()
 
 
-def search(question: str, kb_id: str, project_id: str, department: str, top_k: int) -> list[dict[str, Any]]:
+def search(question: str, kb_id: str, project_id: str, department: str, top_k: int) -> list[DictRow]:
     instructed = f"Instruct: {QUERY_INSTRUCTION}\nQuery: {question}"
     query_vector = vector_literal(embed([instructed])[0])
     with connect() as conn:
@@ -197,11 +203,11 @@ def search(question: str, kb_id: str, project_id: str, department: str, top_k: i
 
 def add_message(session_id: str, role: str, content: str) -> None:
     with connect() as conn:
-        conn.execute("INSERT INTO chat_messages(session_id,role,content,created_at) VALUES(%s,%s,%s,%s)", (session_id, role, content, now()))
+        _ = conn.execute("INSERT INTO chat_messages(session_id,role,content,created_at) VALUES(%s,%s,%s,%s)", (session_id, role, content, now()))
         conn.commit()
 
 
-def list_messages(session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+def list_messages(session_id: str, limit: int | None = None) -> list[DictRow]:
     with connect() as conn:
         if limit:
             return conn.execute(

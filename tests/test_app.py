@@ -132,6 +132,117 @@ def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
     assert embedded == [f"Instruct: {postgres_store.QUERY_INSTRUCTION}\nQuery: 年假审批需要哪些材料？"]
 
 
+def test_insert_document_persists_llm_summaries(monkeypatch):
+    inserted = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def execute(self, _query, params):
+            inserted.append(params)
+            return self
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(postgres_store, "embed", lambda chunks: [[0.0] * 1024 for _ in chunks])
+    monkeypatch.setattr(postgres_store, "summarize_chunks", lambda chunks: ["部署前保存配置。" for _ in chunks])
+    monkeypatch.setattr(postgres_store, "connect", Connection)
+
+    postgres_store.insert_document(
+        kb_id="company",
+        project_id="p-1",
+        document_id="doc-1",
+        filename="guide.md",
+        department="engineering",
+        parser="plain-text",
+        pdf_type=None,
+        pages_needing_ocr=[],
+        chunks=["部署服务前，需要先保存当前配置。"],
+        stored_path="",
+    )
+
+    assert inserted[0][6] == "部署前保存配置。"
+
+
+def test_summarize_chunks_uses_configured_llm(monkeypatch):
+    real_client = httpx.Client
+
+    def handler(request):
+        assert request.url == "http://llm.test/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer secret"
+        assert request.read().find(b'"model":"summary-model"') >= 0
+        return httpx.Response(200, json={"choices": [{"message": {"content": "  部署前保存配置。  "}}]})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "secret")
+    monkeypatch.setenv("LLM_MODEL", "summary-model")
+    monkeypatch.setattr(postgres_store.httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs))
+
+    assert postgres_store.summarize_chunks(["部署服务前，需要先保存当前配置。"]) == ["部署前保存配置。"]
+
+
+def test_summarize_chunks_degrades_per_failed_chunk(monkeypatch):
+    real_client = httpx.Client
+    responses = iter(
+        [
+            httpx.Response(200, json={"choices": [{"message": {"content": "摘要一"}}]}),
+            httpx.Response(503),
+            httpx.Response(200, json={"choices": [{"message": {"content": "摘要三"}}]}),
+        ]
+    )
+    transport = httpx.MockTransport(lambda _request: next(responses))
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "secret")
+    monkeypatch.setattr(postgres_store.httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs))
+
+    assert postgres_store.summarize_chunks(["片段一", "失败片段", "片段三"]) == ["摘要一", "", "摘要三"]
+
+
+def test_insert_document_continues_when_summary_client_fails(monkeypatch):
+    inserted = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def execute(self, _query, params):
+            inserted.append(params)
+            return self
+
+        def commit(self):
+            pass
+
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "secret")
+    monkeypatch.setattr(postgres_store.httpx, "Client", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("client unavailable")))
+    monkeypatch.setattr(postgres_store, "embed", lambda chunks: [[0.0] * 1024 for _ in chunks])
+    monkeypatch.setattr(postgres_store, "connect", Connection)
+
+    postgres_store.insert_document(
+        kb_id="company",
+        project_id="p-1",
+        document_id="doc-1",
+        filename="guide.md",
+        department="engineering",
+        parser="plain-text",
+        pdf_type=None,
+        pages_needing_ocr=[],
+        chunks=["索引必须继续。"],
+        stored_path="",
+    )
+
+    assert inserted[0][6] == ""
+
+
 def test_stream_content_accepts_both_openai_dialects():
     assert stream_content({"choices": [{"delta": {"content": "传统"}}]}) == "传统"
     assert stream_content({"type": "response.output_text.delta", "delta": "响应"}) == "响应"

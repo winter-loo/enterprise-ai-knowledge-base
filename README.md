@@ -9,7 +9,7 @@
 - 知识库内多个 Project
 - `kb_id + project_id + department/general` 召回前过滤
 - pgvector 语义分 + PostgreSQL 词法分 + freshness
-- 可选 OpenAI-compatible 回答生成与本地证据 fallback
+- OpenAI-compatible 文档片段摘要与可选回答生成
 - 原生 HTML 前端
 
 ## 运行
@@ -39,6 +39,8 @@ http://127.0.0.1:11434/v1
 qwen3-embedding:0.6b
 1024 dimensions
 ```
+
+文档入库使用 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL` 调用 OpenAI-compatible `/chat/completions`，为每个片段生成忠实摘要；未配置或单片摘要失败时，该片摘要留空且索引继续。问答生成复用相同配置，`LLM_MODEL` 默认为 `gpt-4o-mini`。
 
 ## API
 

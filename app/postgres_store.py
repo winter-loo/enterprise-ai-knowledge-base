@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from psycopg.sql import SQL
 
 EMBEDDING_DIMENSIONS = 1024
 QUERY_INSTRUCTION = "Given a user question about internal enterprise knowledge, retrieve relevant passages that answer the question"
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingData(TypedDict):
@@ -136,6 +138,46 @@ def embed(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
+def summarize_chunks(chunks: list[str]) -> list[str]:
+    base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
+    api_key = os.getenv("LLM_API_KEY", "")
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    if not base_url or not api_key:
+        return ["" for _ in chunks]
+
+    summaries: list[str] = []
+    try:
+        with httpx.Client(timeout=45) as client:
+            for index, chunk in enumerate(chunks):
+                try:
+                    response = client.post(
+                        f"{base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "model": model,
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": "请将企业知识库片段压缩为一条简洁、忠实的中文摘要。保留关键事实、条件、数字和专有名词，不添加原文没有的信息。只输出摘要。",
+                                },
+                                {"role": "user", "content": chunk},
+                            ],
+                            "temperature": 0.1,
+                            "max_tokens": 160,
+                        },
+                    )
+                    response.raise_for_status()
+                    content = response.json()["choices"][0]["message"]["content"]
+                    summaries.append(content.strip() if isinstance(content, str) else "")
+                except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                    logger.warning("LLM summary failed for chunk %d: %s", index, type(exc).__name__)
+                    summaries.append("")
+    except Exception as exc:
+        logger.warning("LLM summary client failed: %s", type(exc).__name__)
+        summaries.extend("" for _ in chunks[len(summaries) :])
+    return summaries
+
+
 def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(str(float(value)) for value in vector) + "]"
 
@@ -155,9 +197,10 @@ def insert_document(
     chunking_strategy: str = "recursive",
 ) -> dict[str, object]:
     vectors = embed(chunks)
+    summaries = summarize_chunks(chunks)
     created = now()
     with connect() as conn:
-        for index, (content, vector) in enumerate(zip(chunks, vectors, strict=True)):
+        for index, (content, vector, summary) in enumerate(zip(chunks, vectors, summaries, strict=True)):
             _ = conn.execute(
                 """
                 INSERT INTO knowledge_evidence
@@ -171,7 +214,7 @@ def insert_document(
                     document_id,
                     index,
                     content,
-                    content[:500],
+                    summary,
                     vector_literal(vector),
                     department,
                     stored_path,

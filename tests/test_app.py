@@ -11,12 +11,50 @@ def client(monkeypatch):
     monkeypatch.setattr(postgres_store, "ensure_project", lambda kb_id, project_id: {"id": project_id} if (kb_id, project_id) == ("company", "p-1") else None)
     monkeypatch.setattr(postgres_store, "list_kbs", lambda: [{"id": "company", "name": "公司知识库"}])
     monkeypatch.setattr(postgres_store, "list_projects", lambda kb_id: [{"id": "p-1", "kb_id": kb_id, "name": "研发项目"}])
-    monkeypatch.setattr(postgres_store, "list_documents", lambda kb_id: [{"id": "doc-1", "filename": "guide.md", "project_id": "p-1", "department": "engineering", "status": "READY", "chunk_count": 1, "source_type": "upload"}])
-    monkeypatch.setattr(postgres_store, "insert_document", lambda **kw: {"id": kw["document_id"], "filename": kw["filename"], "project_id": kw["project_id"], "status": "READY", "chunk_count": len(kw["chunks"]), "chunking_strategy": kw.get("chunking_strategy", "recursive"), "parser": kw["parser"], "pdf_type": None, "pages_needing_ocr": []})
-    monkeypatch.setattr(postgres_store, "search", lambda question, kb_id, project_id, department, top_k: [{"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "content": "重启服务前先保存配置。", "score": 0.9}])
+    monkeypatch.setattr(
+        postgres_store,
+        "list_documents",
+        lambda kb_id: [
+            {
+                "id": "doc-1",
+                "filename": "guide.md",
+                "project_id": "p-1",
+                "department": "engineering",
+                "status": "READY",
+                "chunk_count": 1,
+                "source_type": "upload",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        postgres_store,
+        "insert_document",
+        lambda **kw: {
+            "id": kw["document_id"],
+            "filename": kw["filename"],
+            "project_id": kw["project_id"],
+            "status": "READY",
+            "chunk_count": len(kw["chunks"]),
+            "chunking_strategy": kw.get("chunking_strategy", "recursive"),
+            "parser": kw["parser"],
+            "pdf_type": None,
+            "pages_needing_ocr": [],
+        },
+    )
+    monkeypatch.setattr(
+        postgres_store,
+        "search",
+        lambda question, kb_id, project_id, department, top_k: [
+            {"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "content": "重启服务前先保存配置。", "score": 0.9}
+        ],
+    )
     messages = []
-    monkeypatch.setattr(postgres_store, "add_message", lambda session_id, role, content: messages.append({"session_id": session_id, "role": role, "content": content}))
-    monkeypatch.setattr(postgres_store, "list_messages", lambda session_id, limit=None: [m for m in messages if m["session_id"] == session_id][-limit if limit else None:])
+    monkeypatch.setattr(
+        postgres_store, "add_message", lambda session_id, role, content: messages.append({"session_id": session_id, "role": role, "content": content})
+    )
+    monkeypatch.setattr(
+        postgres_store, "list_messages", lambda session_id, limit=None: [m for m in messages if m["session_id"] == session_id][-limit if limit else None :]
+    )
     monkeypatch.setattr(postgres_store, "clear_session", lambda session_id: sum(m["session_id"] == session_id for m in messages))
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
@@ -34,7 +72,11 @@ async def test_scope_lists_and_upload(client, monkeypatch):
         assert (await http.get("/api/knowledge-bases")).json()[0]["id"] == "company"
         assert (await http.get("/api/projects?kb_id=company")).json()[0]["id"] == "p-1"
         assert (await http.get("/api/documents?kb_id=company")).json()[0]["project_id"] == "p-1"
-        response = await http.post("/api/documents/upload", files={"file": ("guide.md", b"x", "text/markdown")}, data={"kb_id": "company", "project_id": "p-1", "department": "engineering", "chunking_strategy": "fixed"})
+        response = await http.post(
+            "/api/documents/upload",
+            files={"file": ("guide.md", b"x", "text/markdown")},
+            data={"kb_id": "company", "project_id": "p-1", "department": "engineering", "chunking_strategy": "fixed"},
+        )
     assert response.status_code == 200
     assert response.json()["project_id"] == "p-1"
     assert response.json()["chunking_strategy"] == "fixed"
@@ -43,7 +85,9 @@ async def test_scope_lists_and_upload(client, monkeypatch):
 @pytest.mark.anyio
 async def test_project_scope_is_required(client):
     async with client as http:
-        response = await http.post("/api/documents/upload", files={"file": ("guide.md", b"x", "text/markdown")}, data={"kb_id": "company", "project_id": "other"})
+        response = await http.post(
+            "/api/documents/upload", files={"file": ("guide.md", b"x", "text/markdown")}, data={"kb_id": "company", "project_id": "other"}
+        )
     assert response.status_code == 404
 
 
@@ -67,14 +111,20 @@ def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
     embedded = []
 
     class Connection:
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
         def execute(self, query, params):
             assert "e.kb_id=%s AND e.project_id=%s" in query
             assert "e.department=%s OR e.department='general'" in query
             assert params[1:] == ("年假审批需要哪些材料？", "company", "p-1", "hr", 5)
             return self
-        def fetchall(self): return []
+
+        def fetchall(self):
+            return []
 
     monkeypatch.setattr(postgres_store, "embed", lambda texts: embedded.extend(texts) or [[0.0] * 1024])
     monkeypatch.setattr(postgres_store, "connect", Connection)
@@ -95,8 +145,13 @@ async def test_taskbook_import_history_stream_and_clear(client, monkeypatch):
 
     monkeypatch.setattr("app.main.chat_stream", stream)
     async with client as http:
-        imported = await http.post("/api/v1/document/import", json={"title": "guide.md", "content": "部署步骤。", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
-        response = await http.post("/api/v1/chat/completions", json={"session_id": "s-1", "question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        imported = await http.post(
+            "/api/v1/document/import", json={"title": "guide.md", "content": "部署步骤。", "kb_id": "company", "project_id": "p-1", "department": "engineering"}
+        )
+        response = await http.post(
+            "/api/v1/chat/completions",
+            json={"session_id": "s-1", "question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"},
+        )
         history = await http.get("/api/v1/chat/history/s-1")
         cleared = await http.delete("/api/v1/chat/session/s-1")
     assert imported.status_code == 200

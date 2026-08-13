@@ -75,7 +75,9 @@ def init_db() -> None:
             if count:
                 raise RuntimeError(f"knowledge_evidence contains {count} incompatible vectors; clear it and restart")
             _ = conn.execute(SQL("ALTER TABLE knowledge_evidence ALTER COLUMN embedding TYPE vector(1024)"))
-        _ = conn.execute("INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("company", "公司知识库", "默认企业政策、产品和技术文档", now()))
+        _ = conn.execute(
+            "INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("company", "公司知识库", "默认企业政策、产品和技术文档", now())
+        )
         _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("default", "company", "默认项目", "默认项目范围", now()))
         conn.commit()
 
@@ -138,37 +140,81 @@ def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(str(float(value)) for value in vector) + "]"
 
 
-def insert_document(*, kb_id: str, project_id: str, document_id: str, filename: str, department: str, parser: str, pdf_type: str | None, pages_needing_ocr: list[int], chunks: list[str], stored_path: str, chunking_strategy: str = "recursive") -> dict[str, object]:
+def insert_document(
+    *,
+    kb_id: str,
+    project_id: str,
+    document_id: str,
+    filename: str,
+    department: str,
+    parser: str,
+    pdf_type: str | None,
+    pages_needing_ocr: list[int],
+    chunks: list[str],
+    stored_path: str,
+    chunking_strategy: str = "recursive",
+) -> dict[str, object]:
     vectors = embed(chunks)
     created = now()
     with connect() as conn:
         for index, (content, vector) in enumerate(zip(chunks, vectors, strict=True)):
-            _ = conn.execute("""
+            _ = conn.execute(
+                """
                 INSERT INTO knowledge_evidence
                 (id,kb_id,project_id,document_id,chunk_index,content,summary,embedding,department,status,source_type,source_uri,filename,page,metadata,created_at)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,'READY','upload',%s,%s,NULL,%s::jsonb,%s)
-            """, (uuid.uuid4().hex, kb_id, project_id, document_id, index, content, content[:500], vector_literal(vector), department, stored_path, filename, json.dumps({"parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr, "chunking_strategy": chunking_strategy}), created))
+            """,
+                (
+                    uuid.uuid4().hex,
+                    kb_id,
+                    project_id,
+                    document_id,
+                    index,
+                    content,
+                    content[:500],
+                    vector_literal(vector),
+                    department,
+                    stored_path,
+                    filename,
+                    json.dumps({"parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr, "chunking_strategy": chunking_strategy}),
+                    created,
+                ),
+            )
         conn.commit()
-    return {"id": document_id, "filename": filename, "project_id": project_id, "status": "READY", "chunk_count": len(chunks), "chunking_strategy": chunking_strategy, "parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr}
+    return {
+        "id": document_id,
+        "filename": filename,
+        "project_id": project_id,
+        "status": "READY",
+        "chunk_count": len(chunks),
+        "chunking_strategy": chunking_strategy,
+        "parser": parser,
+        "pdf_type": pdf_type,
+        "pages_needing_ocr": pages_needing_ocr,
+    }
 
 
 def list_documents(kb_id: str) -> list[DictRow]:
     with connect() as conn:
-        return conn.execute("""
+        return conn.execute(
+            """
             SELECT document_id AS id, max(filename) AS filename, max(project_id) AS project_id,
                    max(department) AS department, max(status) AS status, count(*) AS chunk_count,
                    max(source_type) AS source_type, max(metadata->>'parser') AS parser,
                    max(metadata->>'pdf_type') AS pdf_type, max(metadata->>'chunking_strategy') AS chunking_strategy,
                    max(created_at) AS created_at
             FROM knowledge_evidence WHERE kb_id=%s GROUP BY document_id ORDER BY max(created_at) DESC
-        """, (kb_id,)).fetchall()
+        """,
+            (kb_id,),
+        ).fetchall()
 
 
 def search(question: str, kb_id: str, project_id: str, department: str, top_k: int) -> list[DictRow]:
     instructed = f"Instruct: {QUERY_INSTRUCTION}\nQuery: {question}"
     query_vector = vector_literal(embed([instructed])[0])
     with connect() as conn:
-        return conn.execute("""
+        return conn.execute(
+            """
             -- 候选集只包含当前知识库和 Project 中，当前部门可见（本部门或 general）
             -- 且已完成索引的片段。权限过滤发生在评分前，避免越权片段进入召回结果。
             WITH candidates AS (
@@ -198,7 +244,9 @@ def search(question: str, kb_id: str, project_id: str, department: str, top_k: i
             FROM candidates WHERE semantic_score > 0 OR lexical_score > 0
             -- 按混合分降序，只返回调用方要求的 top_k 个片段。
             ORDER BY score DESC LIMIT %s
-        """, (query_vector, question, kb_id, project_id, department, top_k)).fetchall()
+        """,
+            (query_vector, question, kb_id, project_id, department, top_k),
+        ).fetchall()
 
 
 def add_message(session_id: str, role: str, content: str) -> None:

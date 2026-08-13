@@ -14,13 +14,23 @@
 
 ## 运行
 
+首次安装依赖并启用提交前检查：
+
 ```bash
-cd /home/ldd/enterprise-ai-knowledge-base
 uv sync --locked
+make install-hooks
+```
+
+运行服务前先执行完整检查：
+
+```bash
+make check
 set -a; source .local/dev.env; set +a
 export DATABASE_URL='postgresql:///enterprise_ai_kb'
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
+
+`pre-commit` 会在每次提交前自动运行同一套检查；GitHub Actions 也会在 push 和 pull request 时执行，避免跳过本地 hook 后合入问题。
 
 默认 Embedding 服务：
 
@@ -65,9 +75,15 @@ knowledge_bases
 
 所有可检索片段统一进入 `knowledge_evidence`，包含正文、embedding、来源、知识库、Project、部门范围和时间。Project 控制相关性边界；部门控制访问范围，两者不能互相替代。
 
-## 测试
+## 开发检查
 
 ```bash
-uv run pytest -q
-uv run python -m compileall -q app tests
+make lint       # Ruff 静态检查
+make typecheck  # BasedPyright strict 类型检查
+make test       # Pytest
+make compile    # Python 字节码编译检查
+make check      # 依次运行以上全部检查
+make format     # 自动修复 Ruff 问题并格式化
 ```
+
+Ruff 和 BasedPyright 的规则集中配置在 `pyproject.toml`。Ruff 检查并验证格式化整个仓库；BasedPyright 以 strict 模式检查生产代码 `app/`；测试代码由 Ruff 和 Pytest 覆盖。本地、pre-commit 和 CI 都复用这些配置与 `make check`，避免检查结果不一致。

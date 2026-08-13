@@ -173,12 +173,16 @@ async def llm_answer(question: str, sources: list[DictRow], history: list[dict[s
     if not base_url or not api_key:
         return fallback_answer(sources), "local-fallback"
     context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-    messages = [{"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号，如[1]。不要编造政策、数字或来源。"}]
+    messages = [
+        {"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号，如[1]。不要编造政策、数字或来源。"}
+    ]
     messages.extend(history[-6:])
     messages.append({"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{question}"})
     try:
         async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.post(f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1})
+            response = await client.post(
+                f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1}
+            )
             _ = response.raise_for_status()
             payload = cast(CompletionPayload, response.json())
             return payload["choices"][0]["message"]["content"], model
@@ -200,21 +204,33 @@ async def chat_stream(payload: ChatCompletion, sources: list[DictRow], history: 
         yield f"data: {json.dumps({'type': 'error', 'message': 'LLM configuration is required'}, ensure_ascii=False)}\n\n"
         return
     context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-    messages = [{"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号。"}, *history[-12:], {"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"}]
+    messages = [
+        {"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号。"},
+        *history[-12:],
+        {"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"},
+    ]
     answer = ""
     try:
-        async with httpx.AsyncClient(timeout=90) as client, client.stream("POST", f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1, "stream": True}) as response:
-                _ = response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:") or line[5:].strip() == "[DONE]":
-                        continue
-                    try:
-                        delta = stream_content(cast(StreamPayload, json.loads(line[5:].strip())))
-                    except json.JSONDecodeError:
-                        continue
-                    if delta:
-                        answer += delta
-                        yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
+        async with (
+            httpx.AsyncClient(timeout=90) as client,
+            client.stream(
+                "POST",
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": model, "messages": messages, "temperature": 0.1, "stream": True},
+            ) as response,
+        ):
+            _ = response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                    continue
+                try:
+                    delta = stream_content(cast(StreamPayload, json.loads(line[5:].strip())))
+                except json.JSONDecodeError:
+                    continue
+                if delta:
+                    answer += delta
+                    yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
         if not answer:
             raise RuntimeError("LLM stream returned no content")
         postgres_store.add_message(payload.session_id, "assistant", answer)
@@ -277,7 +293,19 @@ async def upload_document(
     document_id = uuid.uuid4().hex
     stored_path = UPLOAD_DIR / f"{document_id}-{Path(filename).name}"
     _ = stored_path.write_bytes(data)
-    return postgres_store.insert_document(kb_id=kb_id, project_id=project_id, document_id=document_id, filename=filename, department=department, parser=parser, pdf_type=pdf_type, pages_needing_ocr=pages_needing_ocr, chunks=chunks, stored_path=str(stored_path), chunking_strategy=chunking_strategy)
+    return postgres_store.insert_document(
+        kb_id=kb_id,
+        project_id=project_id,
+        document_id=document_id,
+        filename=filename,
+        department=department,
+        parser=parser,
+        pdf_type=pdf_type,
+        pages_needing_ocr=pages_needing_ocr,
+        chunks=chunks,
+        stored_path=str(stored_path),
+        chunking_strategy=chunking_strategy,
+    )
 
 
 @app.get("/api/documents")
@@ -292,7 +320,16 @@ async def ask(payload: AskRequest) -> JsonObject:
     project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
     sources = postgres_store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
     answer, answer_mode = await llm_answer(payload.question, sources, payload.history)
-    citations = [{"id": source["id"], "filename": source["filename"], "chunk_index": source["chunk_index"], "score": source["score"], "excerpt": re.sub(r"\s+", " ", row_string(source, "content"))[:300]} for source in sources]
+    citations = [
+        {
+            "id": source["id"],
+            "filename": source["filename"],
+            "chunk_index": source["chunk_index"],
+            "score": source["score"],
+            "excerpt": re.sub(r"\s+", " ", row_string(source, "content"))[:300],
+        }
+        for source in sources
+    ]
     return {"answer": answer, "answer_mode": answer_mode, "citations": citations, "retrieved": len(citations)}
 
 
@@ -303,7 +340,19 @@ def import_document(payload: DocumentImport) -> JsonObject:
     chunks = chunk_document(payload.content, payload.chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文档内容不能为空")
-    return postgres_store.insert_document(kb_id=payload.kb_id, project_id=project_id, document_id=uuid.uuid4().hex, filename=payload.title, department=payload.department, parser="plain-text", pdf_type=None, pages_needing_ocr=[], chunks=chunks, stored_path="", chunking_strategy=payload.chunking_strategy)
+    return postgres_store.insert_document(
+        kb_id=payload.kb_id,
+        project_id=project_id,
+        document_id=uuid.uuid4().hex,
+        filename=payload.title,
+        department=payload.department,
+        parser="plain-text",
+        pdf_type=None,
+        pages_needing_ocr=[],
+        chunks=chunks,
+        stored_path="",
+        chunking_strategy=payload.chunking_strategy,
+    )
 
 
 @app.post("/api/v1/chat/completions")

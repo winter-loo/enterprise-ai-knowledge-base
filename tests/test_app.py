@@ -1,8 +1,34 @@
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 
 from app import postgres_store
-from app.main import app, split_text, stream_content
+from app.main import ChatCompletion, app, chat_stream, split_text, stream_content
+
+
+def _complete_generation(messages, session_id, generation_id, content, kb_id, project_id, department):
+    user = next(
+        (message for message in messages if message["session_id"] == session_id and message["generation_id"] == generation_id and message["role"] == "user"),
+        None,
+    )
+    if user is None:
+        return False
+    user["generation_complete"] = True
+    messages.append(
+        {
+            "session_id": session_id,
+            "session_token": user["session_token"],
+            "role": "assistant",
+            "content": content,
+            "kb_id": kb_id,
+            "project_id": project_id,
+            "department": department,
+            "generation_id": generation_id,
+            "generation_complete": True,
+        }
+    )
+    return True
 
 
 @pytest.fixture
@@ -11,6 +37,11 @@ def client(monkeypatch):
     monkeypatch.setattr(postgres_store, "ensure_project", lambda kb_id, project_id: {"id": project_id} if (kb_id, project_id) == ("company", "p-1") else None)
     monkeypatch.setattr(postgres_store, "list_kbs", lambda: [{"id": "company", "name": "公司知识库"}])
     monkeypatch.setattr(postgres_store, "list_projects", lambda kb_id: [{"id": "p-1", "kb_id": kb_id, "name": "研发项目"}])
+    monkeypatch.setattr(
+        postgres_store,
+        "create_project",
+        lambda kb_id, name, description: {"id": "p-2", "kb_id": kb_id, "name": name, "description": description},
+    )
     monkeypatch.setattr(
         postgres_store,
         "list_documents",
@@ -49,13 +80,73 @@ def client(monkeypatch):
         ],
     )
     messages = []
+
+    def begin_generation(session_id, session_token, content, generation_id, kb_id="company", project_id="default", department="general", history_limit=12):
+        history = [
+            {"role": m["role"], "content": m["content"], "created_at": datetime(2026, 1, 1, tzinfo=UTC)}
+            for m in messages
+            if m["session_id"] == session_id
+            and m["session_token"] == session_token
+            and m.get("generation_complete", False)
+            and (m["kb_id"], m["project_id"], m["department"]) == (kb_id, project_id, department)
+        ][-history_limit:]
+        messages.append(
+            {
+                "session_id": session_id,
+                "session_token": session_token,
+                "role": "user",
+                "content": content,
+                "kb_id": kb_id,
+                "project_id": project_id,
+                "department": department,
+                "generation_id": generation_id,
+                "generation_complete": False,
+            }
+        )
+        return history
+
     monkeypatch.setattr(
-        postgres_store, "add_message", lambda session_id, role, content: messages.append({"session_id": session_id, "role": role, "content": content})
+        postgres_store,
+        "begin_generation",
+        begin_generation,
     )
     monkeypatch.setattr(
-        postgres_store, "list_messages", lambda session_id, limit=None: [m for m in messages if m["session_id"] == session_id][-limit if limit else None :]
+        postgres_store,
+        "list_messages",
+        lambda session_id, limit=None, kb_id=None, project_id=None, department=None, session_token=None: [
+            {"role": m["role"], "content": m["content"], "created_at": datetime(2026, 1, 1, tzinfo=UTC)}
+            for m in messages
+            if m["session_id"] == session_id
+            and m.get("generation_complete", False)
+            and (session_token is None or m["session_token"] == session_token)
+            and (kb_id is None or (m["kb_id"], m["project_id"], m["department"]) == (kb_id, project_id, department))
+        ][-limit if limit else None :],
     )
-    monkeypatch.setattr(postgres_store, "clear_session", lambda session_id: sum(m["session_id"] == session_id for m in messages))
+    monkeypatch.setattr(
+        postgres_store,
+        "clear_session",
+        lambda session_id, kb_id=None, project_id=None, department=None, session_token=None: sum(
+            m["session_id"] == session_id
+            and (kb_id is None or (m["kb_id"], m["project_id"], m["department"]) == (kb_id, project_id, department))
+            and (session_token is None or m["session_token"] == session_token)
+            for m in messages
+        ),
+    )
+    monkeypatch.setattr(
+        postgres_store,
+        "add_assistant_if_generation_active",
+        lambda session_id, generation_id, content, kb_id, project_id, department: _complete_generation(
+            messages, session_id, generation_id, content, kb_id, project_id, department
+        ),
+    )
+    monkeypatch.setattr(
+        postgres_store,
+        "rollback_generation",
+        lambda session_id, generation_id: messages.__setitem__(
+            slice(None),
+            [message for message in messages if not (message["session_id"] == session_id and message["generation_id"] == generation_id)],
+        ),
+    )
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
@@ -63,6 +154,40 @@ def test_split_text_overlaps_chunks():
     chunks = split_text("a" * 1000)
     assert len(chunks) == 2
     assert chunks[0][-100:] == chunks[1][:100]
+
+
+@pytest.mark.anyio
+async def test_web_app_serves_build_assets_and_spa_fallback(client, monkeypatch, tmp_path):
+    build_dir = tmp_path / "build"
+    asset_dir = build_dir / "_app" / "immutable"
+    asset_dir.mkdir(parents=True)
+    (build_dir / "index.html").write_text("<!doctype html><title>Knowledge Base</title>", encoding="utf-8")
+    (asset_dir / "app.js").write_text("console.log('ready')", encoding="utf-8")
+    monkeypatch.setattr("app.main.WEB_BUILD_DIR", build_dir)
+
+    async with client as http:
+        index = await http.get("/")
+        nested_route = await http.get("/chat/session-1")
+        asset = await http.get("/_app/immutable/app.js")
+        unknown_api = await http.get("/api/not-a-route")
+
+    assert index.status_code == 200
+    assert "Knowledge Base" in index.text
+    assert nested_route.text == index.text
+    assert asset.text == "console.log('ready')"
+    assert asset.headers["content-type"].startswith("text/javascript")
+    assert unknown_api.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_web_app_reports_missing_production_build(client, monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.WEB_BUILD_DIR", tmp_path / "missing")
+
+    async with client as http:
+        response = await http.get("/")
+
+    assert response.status_code == 503
+    assert "make build" in response.json()["detail"]
 
 
 @pytest.mark.anyio
@@ -80,6 +205,34 @@ async def test_scope_lists_and_upload(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["project_id"] == "p-1"
     assert response.json()["chunking_strategy"] == "fixed"
+
+
+@pytest.mark.anyio
+async def test_failed_upload_removes_stored_source(client, monkeypatch, tmp_path):
+    monkeypatch.setattr("app.main.UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr("app.main.parse_document", lambda *_: ("部署步骤。", "plain-text", None, []))
+    monkeypatch.setattr(postgres_store, "insert_document", lambda **_: (_ for _ in ()).throw(RuntimeError("embedding unavailable")))
+
+    async with client as http:
+        with pytest.raises(RuntimeError, match="embedding unavailable"):
+            _ = await http.post(
+                "/api/documents/upload",
+                files={"file": ("confidential.md", b"secret", "text/markdown")},
+                data={"kb_id": "company", "project_id": "p-1"},
+            )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.anyio
+async def test_project_creation_is_validated(client):
+    async with client as http:
+        created = await http.post("/api/projects", json={"kb_id": "company", "name": "上线项目", "description": "生产发布资料"})
+        invalid = await http.post("/api/projects", json={"kb_id": "company", "name": ""})
+
+    assert created.status_code == 200
+    assert created.json()["name"] == "上线项目"
+    assert invalid.status_code == 422
 
 
 @pytest.mark.anyio
@@ -250,6 +403,149 @@ def test_stream_content_accepts_both_openai_dialects():
     assert stream_content({"type": "response.output_text.delta", "delta": "响应"}) == "响应"
 
 
+class _FakeStreamResponse:
+    def __init__(self, lines):
+        self.lines = lines
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_lines(self):
+        for line in self.lines:
+            yield line
+
+
+class _FakeAsyncClient:
+    def __init__(self, lines, **_):
+        self.lines = lines
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    def stream(self, *_args, **_kwargs):
+        return _FakeStreamResponse(self.lines)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("lines", "message"),
+    [
+        (['data: {"choices":[{"delta":{"content":"partial"}}]}'], "LLM stream ended before its completion marker"),
+        (["data: {bad-json", "data: [DONE]"], "LLM stream returned malformed JSON"),
+        (["data: null", "data: [DONE]"], "LLM stream returned an invalid event shape"),
+        (
+            ['data: {"choices":[{"delta":{"content":"partial"}}]}', 'data: {"error":{"message":"quota exceeded"}}', "data: [DONE]"],
+            "LLM stream error: quota exceeded",
+        ),
+    ],
+)
+async def test_chat_stream_rejects_truncated_or_malformed_upstream(monkeypatch, lines, message):
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "secret")
+    monkeypatch.setattr("app.main.httpx.AsyncClient", lambda **kwargs: _FakeAsyncClient(lines, **kwargs))
+    stored = []
+    rolled_back = []
+    monkeypatch.setattr(postgres_store, "add_assistant_if_generation_active", lambda *_: stored.append(True))
+    monkeypatch.setattr(postgres_store, "rollback_generation", lambda session_id, generation_id: rolled_back.append((session_id, generation_id)))
+    payload = ChatCompletion(session_id="s-1", session_token="t" * 32, question="继续", kb_id="company", project_id="p-1", department="engineering")
+
+    events = [event async for event in chat_stream(payload, [], [], "generation-1")]
+
+    assert f'"message": "{message}"' in events[-1]
+    assert stored == []
+    assert rolled_back == [("s-1", "generation-1")]
+
+
+@pytest.mark.anyio
+async def test_chat_stream_does_not_finish_when_session_was_cleared(monkeypatch):
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setattr(postgres_store, "add_assistant_if_generation_active", lambda *_: False)
+    rolled_back = []
+    monkeypatch.setattr(postgres_store, "rollback_generation", lambda session_id, generation_id: rolled_back.append((session_id, generation_id)))
+    payload = ChatCompletion(
+        session_id="cleared-session",
+        session_token="t" * 32,
+        question="继续",
+        kb_id="company",
+        project_id="p-1",
+        department="engineering",
+    )
+
+    events = [event async for event in chat_stream(payload, [], [], "generation-1")]
+
+    assert '"type":"error"' in events[-1]
+    assert not any('"type":"done"' in event for event in events)
+    assert rolled_back == [("cleared-session", "generation-1")]
+
+
+@pytest.mark.anyio
+async def test_chat_stream_rolls_back_when_client_disconnects(monkeypatch):
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    rolled_back = []
+    monkeypatch.setattr(postgres_store, "rollback_generation", lambda session_id, generation_id: rolled_back.append((session_id, generation_id)))
+    payload = ChatCompletion(
+        session_id="aborted-session",
+        session_token="t" * 32,
+        question="继续",
+        kb_id="company",
+        project_id="p-1",
+        department="engineering",
+    )
+    stream = chat_stream(payload, [], [], "generation-1")
+
+    _ = await anext(stream)
+    _ = await anext(stream)
+    await stream.aclose()
+
+    assert rolled_back == [("aborted-session", "generation-1")]
+
+
+@pytest.mark.anyio
+async def test_failed_stream_is_excluded_from_history_and_next_prompt(client, monkeypatch):
+    async def failed_stream(*_):
+        yield 'data: {"type":"error","message":"upstream failed"}\n\n'
+
+    monkeypatch.setattr("app.main.chat_stream", failed_stream)
+    token = "t" * 32
+    payload = {
+        "session_id": "failed-stream",
+        "session_token": token,
+        "question": "失败的问题",
+        "kb_id": "company",
+        "project_id": "p-1",
+        "department": "engineering",
+    }
+    scope = {"kb_id": "company", "project_id": "p-1", "department": "engineering"}
+    captured_history = []
+
+    async with client as http:
+        failed = await http.post("/api/v1/chat/completions", json=payload)
+        history = await http.get("/api/v1/chat/history/failed-stream", params=scope, headers={"x-session-token": token})
+
+        async def capture_stream(_, __, prompt_history, ___):
+            captured_history.extend(prompt_history)
+            yield 'data: {"type":"done"}\n\n'
+
+        monkeypatch.setattr("app.main.chat_stream", capture_stream)
+        retried = await http.post("/api/v1/chat/completions", json={**payload, "question": "下一轮问题"})
+
+    assert '"type":"error"' in failed.text
+    assert history.json()["messages"] == []
+    assert retried.status_code == 200
+    assert captured_history == []
+
+
 @pytest.mark.anyio
 async def test_taskbook_import_history_stream_and_clear(client, monkeypatch):
     async def stream(*_):
@@ -263,10 +559,19 @@ async def test_taskbook_import_history_stream_and_clear(client, monkeypatch):
         )
         response = await http.post(
             "/api/v1/chat/completions",
-            json={"session_id": "s-1", "question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"},
+            json={
+                "session_id": "s-1",
+                "session_token": "t" * 32,
+                "question": "如何重启？",
+                "kb_id": "company",
+                "project_id": "p-1",
+                "department": "engineering",
+            },
         )
-        history = await http.get("/api/v1/chat/history/s-1")
-        cleared = await http.delete("/api/v1/chat/session/s-1")
+        scope = {"kb_id": "company", "project_id": "p-1", "department": "engineering"}
+        headers = {"x-session-token": "t" * 32}
+        history = await http.get("/api/v1/chat/history/s-1", params=scope, headers=headers)
+        cleared = await http.delete("/api/v1/chat/session/s-1", params=scope, headers=headers)
     assert imported.status_code == 200
     assert imported.json()["status"] == "READY"
     assert response.status_code == 200
@@ -274,3 +579,127 @@ async def test_taskbook_import_history_stream_and_clear(client, monkeypatch):
     assert '"type":"delta"' in response.text
     assert history.status_code == 200
     assert cleared.json()["deleted"] == 1
+
+
+@pytest.mark.anyio
+async def test_stream_sources_include_ids_and_excerpts(client, monkeypatch):
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+    async with client as http:
+        response = await http.post(
+            "/api/v1/chat/completions",
+            json={
+                "session_id": "source-session",
+                "session_token": "t" * 32,
+                "question": "如何重启？",
+                "kb_id": "company",
+                "project_id": "p-1",
+                "department": "engineering",
+            },
+        )
+
+    assert response.status_code == 200
+    assert '"id": "chunk-1"' in response.text
+    assert '"excerpt": "重启服务前先保存配置。"' in response.text
+    assert '"type": "delta"' in response.text
+    assert '"type":"done"' in response.text
+
+
+@pytest.mark.anyio
+async def test_chat_history_only_passes_model_message_fields(client, monkeypatch):
+    captured_history = []
+    monkeypatch.setattr(
+        postgres_store,
+        "begin_generation",
+        lambda *_: [{"role": "assistant", "content": "上一轮回答", "created_at": datetime(2026, 1, 1, tzinfo=UTC)}],
+    )
+
+    async def capture_stream(_, __, history, ___):
+        captured_history.extend(history)
+        yield 'data: {"type":"done"}\n\n'
+
+    monkeypatch.setattr("app.main.chat_stream", capture_stream)
+
+    async with client as http:
+        response = await http.post(
+            "/api/v1/chat/completions",
+            json={
+                "session_id": "history-session",
+                "session_token": "t" * 32,
+                "question": "继续",
+                "kb_id": "company",
+                "project_id": "p-1",
+                "department": "engineering",
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured_history == [{"role": "assistant", "content": "上一轮回答"}]
+
+
+@pytest.mark.anyio
+async def test_chat_rejects_a_second_active_generation(client, monkeypatch):
+    monkeypatch.setattr(postgres_store, "begin_generation", lambda *_: None)
+
+    async with client as http:
+        response = await http.post(
+            "/api/v1/chat/completions",
+            json={
+                "session_id": "busy-session",
+                "session_token": "t" * 32,
+                "question": "并发问题",
+                "kb_id": "company",
+                "project_id": "p-1",
+                "department": "engineering",
+            },
+        )
+
+    assert response.status_code == 409
+    assert "已有生成请求" in response.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_chat_history_and_clear_are_scope_bound(client):
+    async with client as http:
+        _ = await http.post(
+            "/api/v1/chat/completions",
+            json={
+                "session_id": "scoped",
+                "session_token": "t" * 32,
+                "question": "如何重启？",
+                "kb_id": "company",
+                "project_id": "p-1",
+                "department": "engineering",
+            },
+        )
+        headers = {"x-session-token": "t" * 32}
+        wrong = await http.get("/api/v1/chat/history/scoped", params={"kb_id": "company", "project_id": "p-1", "department": "hr"}, headers=headers)
+        correct = await http.get("/api/v1/chat/history/scoped", params={"kb_id": "company", "project_id": "p-1", "department": "engineering"}, headers=headers)
+        wrong_clear = await http.delete("/api/v1/chat/session/scoped", params={"kb_id": "company", "project_id": "p-1", "department": "hr"}, headers=headers)
+
+    assert wrong.json()["messages"] == []
+    assert correct.json()["messages"][0]["role"] == "user"
+    assert wrong_clear.json()["deleted"] == 0
+
+
+@pytest.mark.anyio
+async def test_search_failure_rolls_back_pending_user_message(client, monkeypatch):
+    monkeypatch.setattr(postgres_store, "search", lambda *_: (_ for _ in ()).throw(RuntimeError("embedding unavailable")))
+    token = "t" * 32
+    payload = {
+        "session_id": "failed-search",
+        "session_token": token,
+        "question": "这条消息不应被保留",
+        "kb_id": "company",
+        "project_id": "p-1",
+        "department": "engineering",
+    }
+    scope = {"kb_id": "company", "project_id": "p-1", "department": "engineering"}
+
+    async with client as http:
+        with pytest.raises(RuntimeError, match="embedding unavailable"):
+            _ = await http.post("/api/v1/chat/completions", json=payload)
+        history = await http.get("/api/v1/chat/history/failed-search", params=scope, headers={"x-session-token": token})
+
+    assert history.json()["messages"] == []

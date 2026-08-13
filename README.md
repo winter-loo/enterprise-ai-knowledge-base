@@ -70,5 +70,3 @@ knowledge_bases
 uv run pytest -q
 uv run python -m compileall -q app tests
 ```
-
-详细说明见 [`docs/运行原理与面试讲解.md`](docs/运行原理与面试讲解.md)。

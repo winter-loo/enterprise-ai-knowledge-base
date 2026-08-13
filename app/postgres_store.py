@@ -4,21 +4,25 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import psycopg
-from psycopg.rows import dict_row
+from psycopg.rows import DictRow, dict_row
+from psycopg.sql import SQL
 
 EMBEDDING_DIMENSIONS = 1024
 QUERY_INSTRUCTION = "Given a user question about internal enterprise knowledge, retrieve relevant passages that answer the question"
 
 
-def connect() -> psycopg.Connection:
+def connect() -> psycopg.Connection[DictRow]:
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
-    return psycopg.connect(database_url, row_factory=dict_row)
+    return cast(
+        psycopg.Connection[DictRow],
+        psycopg.connect(database_url, row_factory=cast(Any, dict_row)),
+    )
 
 
 def now() -> str:
@@ -51,15 +55,21 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_evidence_fts ON knowledge_evidence USING GIN (to_tsvector('simple', content));
             CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_messages(session_id, id);
         """)
-        dimensions = conn.execute("""
+        dimension_row = conn.execute("""
             SELECT atttypmod FROM pg_attribute
             WHERE attrelid='knowledge_evidence'::regclass AND attname='embedding'
-        """).fetchone()["atttypmod"]
+        """).fetchone()
+        if dimension_row is None:
+            raise RuntimeError("knowledge_evidence.embedding column was not created")
+        dimensions = dimension_row["atttypmod"]
         if dimensions != EMBEDDING_DIMENSIONS:
-            count = conn.execute("SELECT count(*) AS count FROM knowledge_evidence").fetchone()["count"]
+            count_row = conn.execute("SELECT count(*) AS count FROM knowledge_evidence").fetchone()
+            if count_row is None:
+                raise RuntimeError("could not count knowledge_evidence rows")
+            count = count_row["count"]
             if count:
                 raise RuntimeError(f"knowledge_evidence contains {count} incompatible vectors; clear it and restart")
-            conn.execute(f"ALTER TABLE knowledge_evidence ALTER COLUMN embedding TYPE vector({EMBEDDING_DIMENSIONS})")
+            conn.execute(SQL("ALTER TABLE knowledge_evidence ALTER COLUMN embedding TYPE vector(1024)"))
         conn.execute("INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("company", "公司知识库", "默认企业政策、产品和技术文档", now()))
         conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("default", "company", "默认项目", "默认项目范围", now()))
         conn.commit()

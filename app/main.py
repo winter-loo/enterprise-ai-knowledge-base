@@ -6,7 +6,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, cast
 
 import anydoc
 import httpx
@@ -83,7 +83,8 @@ def extract_text(filename: str, data: bytes) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in {".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".xls", ".xlsx", ".xlsm", ".xlsb", ".odt", ".ods", ".odp", ".rtf", ".epub", ".csv"}:
         try:
-            return anydoc.to_markdown_bytes(data, suffix.removeprefix("."))
+            document_format = cast(anydoc.Format, suffix.removeprefix("."))
+            return anydoc.to_markdown_bytes(data, document_format)
         except Exception as exc:
             raise HTTPException(415, f"文档解析失败：{exc}") from exc
     if suffix in {".txt", ".md", ".json", ".log", ".html", ".xml"}:

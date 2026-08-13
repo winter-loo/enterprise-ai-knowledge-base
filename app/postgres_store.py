@@ -13,6 +13,13 @@ from psycopg.rows import DictRow, dict_row
 from psycopg.sql import SQL
 
 EMBEDDING_DIMENSIONS = 1024
+# Qwen3 Embedding 属于支持 instruction-aware retrieval 的向量模型。相同的一段文字, 在不同任务下可能应该产生不同的向量表示。
+# 这条指令告诉模型:
+# - 输入是用户查询, 不是普通文档
+# - 任务是检索
+# - 检索对象是企业内部知识
+# - 希望找到能够回答问题的相关段落
+# 这样生成的查询向量通常更适合与知识库片段的向量做相似度计算
 QUERY_INSTRUCTION = "Given a user question about internal enterprise knowledge, retrieve relevant passages that answer the question"
 logger = logging.getLogger(__name__)
 

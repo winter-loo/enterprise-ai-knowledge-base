@@ -103,6 +103,12 @@ def ensure_project(kb_id: str, project_id: str) -> DictRow:
     return row
 
 
+def resolve_project_id(kb_id: str, project_id: str) -> str:
+    """Validate a document scope in one synchronous worker-pool operation."""
+    _ = ensure_kb(kb_id)
+    return row_string(ensure_project(kb_id, project_id), "id")
+
+
 def extract_text(filename: str, data: bytes) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in {".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".xls", ".xlsx", ".xlsm", ".xlsb", ".odt", ".ods", ".odp", ".rtf", ".epub", ".csv"}:
@@ -305,8 +311,9 @@ async def upload_document(
     department: Annotated[str, Form()] = "general",
     chunking_strategy: Annotated[Literal["fixed", "recursive", "semantic", "paragraph"], Form()] = "recursive",
 ) -> JsonObject:
-    _ = ensure_kb(kb_id)
-    project_id = row_string(ensure_project(kb_id, project_id), "id")
+    # Scope validation performs synchronous PostgreSQL calls; keep it off the
+    # event loop along with semantic chunking and document indexing.
+    project_id = await run_in_threadpool(resolve_project_id, kb_id, project_id)
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件不能超过 10MB")
@@ -370,8 +377,9 @@ async def ask(payload: AskRequest) -> JsonObject:
 
 @app.post("/api/v1/document/import")
 async def import_document(payload: DocumentImport) -> JsonObject:
-    _ = ensure_kb(payload.kb_id)
-    project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
+    # Scope validation performs synchronous PostgreSQL calls; keep it off the
+    # event loop along with semantic chunking and document indexing.
+    project_id = await run_in_threadpool(resolve_project_id, payload.kb_id, payload.project_id)
     # Semantic chunking can make synchronous embedding requests, so it must
     # also run in the worker pool before insert_document is scheduled there.
     chunks = await run_in_threadpool(chunk_document, payload.content, payload.chunking_strategy)

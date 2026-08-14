@@ -178,6 +178,10 @@ async def chat_stream(
     history: list[dict[str, str]],
     generation_id: str,
 ) -> AsyncIterator[str]:
+    # A generation is one persisted user turn plus its eventual assistant turn.
+    # The LLM call is streamed outside the database transaction, so the
+    # generation_id lets the completion step verify that this turn still exists
+    # (and was not cleared or superseded) before saving the assistant response.
     persisted = False
     try:
         citations = [
@@ -383,6 +387,9 @@ def import_document(payload: DocumentImport) -> JsonObject:
 def chat_completions(payload: ChatCompletion) -> StreamingResponse:
     _ = ensure_kb(payload.kb_id)
     project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
+    # session_id identifies the conversation; generation_id identifies this
+    # individual question/answer turn. Keeping them separate prevents a late
+    # stream from writing into a newer or already-cleared conversation.
     generation_id = uuid.uuid4().hex
     history_rows = postgres_store.begin_generation(
         payload.session_id,

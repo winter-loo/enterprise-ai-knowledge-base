@@ -362,6 +362,14 @@ def begin_generation(
     department: str = "general",
     history_limit: int = 12,
 ) -> list[DictRow] | None:
+    """Reserve one chat turn and return only history from completed turns.
+
+    The reservation is deliberately committed before retrieval/LLM work: those
+    operations can take a long time and must not hold a database transaction.
+    The pending user row, generation_id, session token, and advisory lock give
+    later completion/rollback code an atomic way to decide whether the stream
+    may still write an assistant message.
+    """
     with connect() as conn:
         _ = conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (session_id,))
         token_hash = session_token_hash(session_token)
@@ -500,7 +508,12 @@ def add_assistant_if_generation_active(
     project_id: str,
     department: str,
 ) -> bool:
-    """Atomically reject late assistant writes after the user generation row was cleared."""
+    """Complete a reserved turn only if its user row is still active.
+
+    This conditional insert closes the clear-vs-stream race: if another request
+    deleted the pending generation while the LLM was streaming, no assistant
+    row is inserted and the caller can report that the answer was not saved.
+    """
     with connect() as conn:
         _ = conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (session_id,))
         inserted = conn.execute(
@@ -544,7 +557,12 @@ def add_assistant_if_generation_active(
 
 
 def rollback_generation(session_id: str, generation_id: str) -> None:
-    """Remove the pending user row when search, streaming, or the client connection fails."""
+    """Remove an unfinished turn after search, streaming, or client failure.
+
+    Without this rollback, a user question whose assistant response never
+    completed would remain in persistent history and be sent to the model as if
+    it were a valid prior turn on the next request.
+    """
     with connect() as conn:
         _ = conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (session_id,))
         _ = conn.execute(

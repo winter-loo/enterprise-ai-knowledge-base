@@ -16,6 +16,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from psycopg.rows import DictRow
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from app import postgres_store
 from app.chunking import chunk_text
@@ -318,7 +319,11 @@ async def upload_document(
     stored_path = UPLOAD_DIR / f"{document_id}-{Path(filename).name}"
     try:
         _ = stored_path.write_bytes(data)
-        return postgres_store.insert_document(
+        # Embedding, per-chunk summaries, and database writes are synchronous
+        # network/IO work. Run them in Starlette's worker pool so a large upload
+        # cannot block the FastAPI event loop and starve health/chat requests.
+        return await run_in_threadpool(
+            postgres_store.insert_document,
             kb_id=kb_id,
             project_id=project_id,
             document_id=document_id,
@@ -362,13 +367,16 @@ async def ask(payload: AskRequest) -> JsonObject:
 
 
 @app.post("/api/v1/document/import")
-def import_document(payload: DocumentImport) -> JsonObject:
+async def import_document(payload: DocumentImport) -> JsonObject:
     _ = ensure_kb(payload.kb_id)
     project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
     chunks = chunk_document(payload.content, payload.chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文档内容不能为空")
-    return postgres_store.insert_document(
+    # Keep the import endpoint non-blocking for the same reason as uploads:
+    # indexing performs synchronous embedding, LLM, and PostgreSQL operations.
+    return await run_in_threadpool(
+        postgres_store.insert_document,
         kb_id=payload.kb_id,
         project_id=project_id,
         document_id=uuid.uuid4().hex,

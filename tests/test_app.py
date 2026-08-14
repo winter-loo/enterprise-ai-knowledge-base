@@ -1,10 +1,13 @@
+import json
 from datetime import UTC, datetime
 
 import httpx
 import pytest
+from psycopg._queries import _split_query
 
 from app import postgres_store
-from app.main import ChatCompletion, app, chat_stream, split_text, stream_content
+from app.main import ChatCompletion, app, chat_stream, llm_answer, split_text, stream_content
+from app.openai_responses import response_answer_text
 
 
 def _complete_generation(messages, session_id, generation_id, content, kb_id, project_id, department):
@@ -271,6 +274,7 @@ def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
             pass
 
         def execute(self, query, params):
+            _ = _split_query(query.encode("utf-8"))
             assert "e.kb_id=%s AND e.project_id=%s" in query
             assert "e.department=%s OR e.department='general'" in query
             assert params[1:] == ("年假审批需要哪些材料？", "company", "p-1", "hr", 5)
@@ -326,12 +330,22 @@ def test_summarize_chunks_uses_configured_llm(monkeypatch):
     real_client = httpx.Client
 
     def handler(request):
-        assert request.url == "http://llm.test/v1/chat/completions"
+        assert request.url == "http://llm.test/v1/responses"
         assert request.headers["authorization"] == "Bearer secret"
-        request_body = request.read()
-        assert request_body.find(b'"model":"summary-model"') >= 0
-        assert "摘要必须保持原文语言，不要翻译" in request_body.decode()
-        return httpx.Response(200, json={"choices": [{"message": {"content": "  部署前保存配置。  "}}]})
+        request_body = json.loads(request.read())
+        assert request_body["model"] == "summary-model"
+        assert "摘要必须保持原文语言，不要翻译" in request_body["instructions"]
+        assert request_body["input"] == [{"role": "user", "content": "部署服务前，需要先保存当前配置。"}]
+        assert request_body["max_output_tokens"] == 160
+        assert request_body["store"] is False
+        assert "messages" not in request_body
+        return httpx.Response(
+            200,
+            json={
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "  部署前保存配置。  "}]}],
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
@@ -346,9 +360,9 @@ def test_summarize_chunks_degrades_per_failed_chunk(monkeypatch):
     real_client = httpx.Client
     responses = iter(
         [
-            httpx.Response(200, json={"choices": [{"message": {"content": "摘要一"}}]}),
+            httpx.Response(200, json={"status": "completed", "output": [{"content": [{"type": "output_text", "text": "摘要一"}]}]}),
             httpx.Response(503),
-            httpx.Response(200, json={"choices": [{"message": {"content": "摘要三"}}]}),
+            httpx.Response(200, json={"status": "completed", "output": [{"content": [{"type": "output_text", "text": "摘要三"}]}]}),
         ]
     )
     transport = httpx.MockTransport(lambda _request: next(responses))
@@ -398,9 +412,49 @@ def test_insert_document_continues_when_summary_client_fails(monkeypatch):
     assert inserted[0][6] == ""
 
 
-def test_stream_content_accepts_both_openai_dialects():
-    assert stream_content({"choices": [{"delta": {"content": "传统"}}]}) == "传统"
+def test_stream_content_accepts_responses_api_text_and_refusal_deltas():
     assert stream_content({"type": "response.output_text.delta", "delta": "响应"}) == "响应"
+    assert stream_content({"type": "response.refusal.delta", "delta": "无法回答"}) == "无法回答"
+
+
+def test_response_answer_text_preserves_refusals():
+    payload = {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "无法安全回答。"}]}],
+    }
+
+    assert response_answer_text(payload) == "无法安全回答。"
+
+
+@pytest.mark.anyio
+async def test_llm_answer_uses_responses_api(monkeypatch):
+    real_client = httpx.AsyncClient
+
+    def handler(request):
+        assert request.url == "http://llm.test/v1/responses"
+        request_body = json.loads(request.read())
+        assert request_body["instructions"].startswith("你是企业知识库助手")
+        assert request_body["input"][-1] == {"role": "user", "content": "参考资料：\n无\n\n问题：当前有哪些资料？"}
+        assert request_body["store"] is False
+        assert "messages" not in request_body
+        return httpx.Response(
+            200,
+            json={
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "当前没有资料。"}]}],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "secret")
+    monkeypatch.setenv("LLM_MODEL", "responses-model")
+    monkeypatch.setattr("app.main.httpx.AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs))
+
+    answer, mode = await llm_answer("当前有哪些资料？", [], [])
+
+    assert answer == "当前没有资料。"
+    assert mode == "responses-model"
 
 
 class _FakeStreamResponse:
@@ -436,14 +490,63 @@ class _FakeAsyncClient:
 
 
 @pytest.mark.anyio
+async def test_chat_stream_accepts_responses_api_completion_event(monkeypatch):
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "secret")
+    lines = [
+        'data: {"type":"response.output_text.delta","delta":"真实回答"}',
+        'data: {"type":"response.completed"}',
+    ]
+
+    class CaptureClient(_FakeAsyncClient):
+        def stream(self, method, url, **kwargs):
+            assert method == "POST"
+            assert url == "http://llm.test/v1/responses"
+            request_body = kwargs["json"]
+            assert request_body["input"][-1]["role"] == "user"
+            assert request_body["store"] is False
+            assert "messages" not in request_body
+            return super().stream(method, url, **kwargs)
+
+    monkeypatch.setattr("app.main.httpx.AsyncClient", lambda **kwargs: CaptureClient(lines, **kwargs))
+    stored = []
+    rolled_back = []
+    monkeypatch.setattr(postgres_store, "add_assistant_if_generation_active", lambda *args: stored.append(args) or True)
+    monkeypatch.setattr(postgres_store, "rollback_generation", lambda *args: rolled_back.append(args))
+    payload = ChatCompletion(
+        session_id="responses-api",
+        session_token="t" * 32,
+        question="继续",
+        kb_id="company",
+        project_id="p-1",
+        department="engineering",
+    )
+
+    events = [event async for event in chat_stream(payload, [], [], "generation-1")]
+
+    assert any('"type":"done"' in event for event in events)
+    assert not any('"type": "error"' in event for event in events)
+    assert stored[0][2] == "真实回答"
+    assert rolled_back == []
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("lines", "message"),
     [
-        (['data: {"choices":[{"delta":{"content":"partial"}}]}'], "LLM stream ended before its completion marker"),
-        (["data: {bad-json", "data: [DONE]"], "LLM stream returned malformed JSON"),
-        (["data: null", "data: [DONE]"], "LLM stream returned an invalid event shape"),
+        (['data: {"type":"response.output_text.delta","delta":"partial"}'], "LLM stream ended before its completion marker"),
         (
-            ['data: {"choices":[{"delta":{"content":"partial"}}]}', 'data: {"error":{"message":"quota exceeded"}}', "data: [DONE]"],
+            ['data: {"type":"response.output_text.delta","delta":"partial"}', "data: [DONE]"],
+            "LLM Responses stream returned an unexpected [DONE] marker",
+        ),
+        (["data: {bad-json", 'data: {"type":"response.completed"}'], "LLM stream returned malformed JSON"),
+        (["data: null", 'data: {"type":"response.completed"}'], "LLM stream returned an invalid event shape"),
+        (
+            [
+                'data: {"type":"response.output_text.delta","delta":"partial"}',
+                'data: {"type":"error","message":"quota exceeded"}',
+                'data: {"type":"response.completed"}',
+            ],
             "LLM stream error: quota exceeded",
         ),
     ],

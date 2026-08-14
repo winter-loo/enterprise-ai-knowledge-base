@@ -14,6 +14,8 @@ import psycopg
 from psycopg.rows import DictRow, dict_row
 from psycopg.sql import SQL
 
+from app.openai_responses import build_response_input, build_response_request, response_answer_text
+
 EMBEDDING_DIMENSIONS = 1024
 # Qwen3 Embedding 属于支持 instruction-aware retrieval 的向量模型。相同的一段文字, 在不同任务下可能应该产生不同的向量表示。
 # 这条指令告诉模型:
@@ -24,6 +26,7 @@ EMBEDDING_DIMENSIONS = 1024
 # 这样生成的查询向量通常更适合与知识库片段的向量做相似度计算
 GENERATION_LEASE_SECONDS = 900
 QUERY_INSTRUCTION = "Given a user question about internal enterprise knowledge, retrieve relevant passages that answer the question"
+SUMMARY_INSTRUCTIONS = "请将企业知识库片段压缩为一条简洁、忠实的摘要。摘要必须保持原文语言，不要翻译：中文原文输出中文，英文原文输出英文，其他语言同理。保留关键事实、条件、数字和专有名词，不添加原文没有的信息。只输出摘要。"
 logger = logging.getLogger(__name__)
 
 
@@ -211,25 +214,18 @@ def summarize_chunks(chunks: list[str]) -> list[str]:
             for index, chunk in enumerate(chunks):
                 try:
                     response = client.post(
-                        f"{base_url}/chat/completions",
+                        f"{base_url}/responses",
                         headers={"Authorization": f"Bearer {api_key}"},
-                        json={
-                            "model": model,
-                            "messages": [
-                                {
-                                    "role": "system",
-                                    "content": "请将企业知识库片段压缩为一条简洁、忠实的摘要。摘要必须保持原文语言，不要翻译：中文原文输出中文，英文原文输出英文，其他语言同理。保留关键事实、条件、数字和专有名词，不添加原文没有的信息。只输出摘要。",
-                                },
-                                {"role": "user", "content": chunk},
-                            ],
-                            "temperature": 0.1,
-                            "max_tokens": 160,
-                        },
+                        json=build_response_request(
+                            model,
+                            SUMMARY_INSTRUCTIONS,
+                            build_response_input([], chunk, 0),
+                            max_output_tokens=160,
+                        ),
                     )
                     response.raise_for_status()
-                    content = response.json()["choices"][0]["message"]["content"]
-                    summaries.append(content.strip() if isinstance(content, str) else "")
-                except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                    summaries.append(response_answer_text(cast(object, response.json())))
+                except (httpx.HTTPError, TypeError, ValueError) as exc:
                     logger.warning("LLM summary failed for chunk %d: %s", index, type(exc).__name__)
                     summaries.append("")
     except Exception as exc:
@@ -336,7 +332,7 @@ def search(question: str, kb_id: str, project_id: str, department: str, top_k: i
                   AND (e.department=%s OR e.department='general') AND e.status='READY'
             )
             SELECT candidates.*,
-                   -- 最终分数 = 75% 语义相似度 + 25% 词法相关性 + 新鲜度奖励。
+                   -- 最终分数 = 语义相似度权重 0.75 + 词法相关性权重 0.25 + 新鲜度奖励。
                    -- 新鲜度项为 0.1/(1+age_days/30)：当天约 0.1，30 天约 0.05，
                    -- 90 天约 0.025，只用于同等相关内容的轻量排序，不应压过相关性。
                    -- 0.75/0.25 是当前 MVP 的经验权重，不代表经过离线评测调优；

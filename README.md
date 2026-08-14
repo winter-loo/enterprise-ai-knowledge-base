@@ -68,7 +68,7 @@ qwen3-embedding:0.6b
 1024 dimensions
 ```
 
-文档入库使用 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL` 调用 OpenAI-compatible `/chat/completions`，为每个片段生成忠实摘要；未配置或单片摘要失败时，该片摘要留空且索引继续。问答生成复用相同配置，`LLM_MODEL` 默认为 `gpt-4o-mini`。
+文档入库使用 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL` 调用 OpenAI-compatible `/responses`，为每个片段生成忠实摘要；未配置或单片摘要失败时，该片摘要留空且索引继续。问答生成复用相同配置，并解析 `response.output_text.delta` 与 `response.completed` 流式事件；`LLM_MODEL` 默认为 `gpt-4o-mini`。面向 Web UI 的 `/api/v1/chat/completions` 路径保持不变，它是本项目自己的兼容层，并不代表内部仍调用 Chat Completions API。
 
 ## API
 

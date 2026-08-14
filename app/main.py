@@ -7,7 +7,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal, TypedDict, cast
+from typing import Annotated, Literal, cast
 
 import anydoc
 import httpx
@@ -19,53 +19,25 @@ from pydantic import BaseModel, Field
 
 from app import postgres_store
 from app.chunking import chunk_text
+from app.openai_responses import (
+    build_response_input,
+    build_response_request,
+    response_answer_text,
+    stream_completed,
+    stream_error,
+)
+from app.openai_responses import (
+    stream_delta as stream_content,
+)
 
 JsonObject = dict[str, object]
-
-
-class ChatMessage(TypedDict):
-    role: str
-    content: str
-
-
-class ChatChoiceDelta(TypedDict, total=False):
-    content: str
-
-
-class ChatChoice(TypedDict):
-    delta: ChatChoiceDelta
-
-
-class StreamPayload(TypedDict, total=False):
-    type: str
-    delta: str
-    choices: list[ChatChoice]
-
-
-class UpstreamError(TypedDict, total=False):
-    message: str
-
-
-class UpstreamErrorPayload(TypedDict, total=False):
-    error: UpstreamError
-
-
-class CompletionMessage(TypedDict):
-    content: str
-
-
-class CompletionChoice(TypedDict):
-    message: CompletionMessage
-
-
-class CompletionPayload(TypedDict):
-    choices: list[CompletionChoice]
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 WEB_BUILD_DIR = BASE_DIR / "web" / "build"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+KNOWLEDGE_ASSISTANT_INSTRUCTIONS = "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号，如[1]。不要编造政策、数字或来源。"
 
 
 @asynccontextmanager
@@ -186,38 +158,18 @@ async def llm_answer(question: str, sources: list[DictRow], history: list[dict[s
     if not base_url or not api_key:
         return fallback_answer(sources), "local-fallback"
     context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-    messages = [
-        {"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号，如[1]。不要编造政策、数字或来源。"}
-    ]
-    messages.extend(history[-6:])
-    messages.append({"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{question}"})
+    prompt = f"参考资料：\n{context or '无'}\n\n问题：{question}"
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(
-                f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1}
+                f"{base_url}/responses",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=build_response_request(model, KNOWLEDGE_ASSISTANT_INSTRUCTIONS, build_response_input(history, prompt, 6)),
             )
             _ = response.raise_for_status()
-            payload = cast(CompletionPayload, response.json())
-            return payload["choices"][0]["message"]["content"], model
-    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError):
+            return response_answer_text(cast(object, response.json())), model
+    except (httpx.HTTPError, ValueError):
         return fallback_answer(sources), "local-fallback-after-llm-error"
-
-
-def stream_content(payload: StreamPayload) -> str:
-    if payload.get("type") == "response.output_text.delta":
-        return payload.get("delta", "")
-    choices = payload.get("choices", [])
-    return choices[0].get("delta", {}).get("content", "") if choices else ""
-
-
-def stream_error(payload: object) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    error = cast(UpstreamErrorPayload, payload).get("error")
-    if not isinstance(error, dict):
-        return None
-    message = error.get("message")
-    return message if isinstance(message, str) and message else "Upstream LLM returned an error"
 
 
 async def chat_stream(
@@ -254,11 +206,7 @@ async def chat_stream(
             yield 'data: {"type":"done"}\n\n'
             return
         context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-        messages = [
-            {"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号。"},
-            *history[-12:],
-            {"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"},
-        ]
+        prompt = f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"
         answer = ""
         completed = False
         try:
@@ -266,9 +214,14 @@ async def chat_stream(
                 httpx.AsyncClient(timeout=90) as client,
                 client.stream(
                     "POST",
-                    f"{base_url}/chat/completions",
+                    f"{base_url}/responses",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    json={"model": model, "messages": messages, "temperature": 0.1, "stream": True},
+                    json=build_response_request(
+                        model,
+                        KNOWLEDGE_ASSISTANT_INSTRUCTIONS,
+                        build_response_input(history, prompt, 12),
+                        stream=True,
+                    ),
                 ) as response,
             ):
                 _ = response.raise_for_status()
@@ -277,8 +230,7 @@ async def chat_stream(
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
-                        completed = True
-                        break
+                        raise RuntimeError("LLM Responses stream returned an unexpected [DONE] marker")
                     try:
                         upstream_payload = cast(object, json.loads(data))
                     except json.JSONDecodeError as exc:
@@ -288,7 +240,10 @@ async def chat_stream(
                     error_message = stream_error(cast(object, upstream_payload))
                     if error_message:
                         raise RuntimeError(f"LLM stream error: {error_message}")
-                    delta = stream_content(cast(StreamPayload, upstream_payload))
+                    if stream_completed(cast(object, upstream_payload)):
+                        completed = True
+                        break
+                    delta = stream_content(cast(object, upstream_payload))
                     if delta:
                         answer += delta
                         yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"

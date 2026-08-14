@@ -13,6 +13,7 @@ dependencies = [
     "fastapi>=0.115,<1",
     "firecrawl-anydoc==0.1.8",
     "httpx>=0.27,<1",
+    "multimark==0.3.2",
     "pdf-inspector==1.14.1",
     "psycopg[binary]>=3.2,<4",
     "python-multipart>=0.0.9,<1",

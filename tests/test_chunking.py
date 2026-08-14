@@ -47,6 +47,48 @@ def test_paragraph_strategy_repeats_heading_for_oversized_section():
     assert chunks[-1] == "# 运维\n\n检查日志。"
 
 
+def test_paragraph_strategy_recognizes_setext_heading():
+    text = "安装指南\n========\n\n" + "步骤。" * 12
+
+    chunks = chunk_text(text, strategy="paragraph", size=24, overlap=0)
+
+    assert len(chunks) >= 2
+    assert all(chunk.startswith("安装指南\n========") for chunk in chunks)
+
+
+def test_paragraph_strategy_ignores_heading_syntax_inside_code_fence():
+    text = "# 示例\n\n```markdown\n# 这不是标题\n```\n\n结束。"
+
+    chunks = chunk_text(text, strategy="paragraph", size=100, overlap=0)
+
+    assert chunks == [text]
+
+
+def test_paragraph_strategy_preserves_indented_code_block():
+    text = "# 示例\n\n    print('保留缩进')"
+
+    chunks = chunk_text(text, strategy="paragraph", size=100, overlap=0)
+
+    assert chunks == [text]
+
+
+def test_paragraph_strategy_does_not_treat_link_definition_as_heading():
+    text = "# API\n\n[文档]: https://example.com/reference\n\n" + "正文。" * 8
+
+    chunks = chunk_text(text, strategy="paragraph", size=48, overlap=0)
+
+    assert all(len(chunk) <= 48 for chunk in chunks)
+    assert any("[文档]: https://example.com/reference" in chunk for chunk in chunks)
+
+
+def test_paragraph_strategy_preserves_spacing_between_body_blocks():
+    text = "# 示例\n正文\n- 条目"
+
+    chunks = chunk_text(text, strategy="paragraph", size=100, overlap=0)
+
+    assert chunks == ["# 示例\n\n正文\n- 条目"]
+
+
 def test_unknown_strategy_fails_at_boundary():
     with pytest.raises(ValueError, match="unknown chunking strategy"):
         chunk_text("content", strategy="magic")

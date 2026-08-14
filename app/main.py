@@ -7,58 +7,37 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Literal, TypedDict, cast
+from typing import Annotated, Literal, cast
 
 import anydoc
 import httpx
 import pdf_inspector
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from psycopg.rows import DictRow
 from pydantic import BaseModel, Field
 
 from app import postgres_store
 from app.chunking import chunk_text
+from app.openai_responses import (
+    build_response_input,
+    build_response_request,
+    response_answer_text,
+    stream_completed,
+    stream_error,
+)
+from app.openai_responses import (
+    stream_delta as stream_content,
+)
 
 JsonObject = dict[str, object]
 
 
-class ChatMessage(TypedDict):
-    role: str
-    content: str
-
-
-class ChatChoiceDelta(TypedDict, total=False):
-    content: str
-
-
-class ChatChoice(TypedDict):
-    delta: ChatChoiceDelta
-
-
-class StreamPayload(TypedDict, total=False):
-    type: str
-    delta: str
-    choices: list[ChatChoice]
-
-
-class CompletionMessage(TypedDict):
-    content: str
-
-
-class CompletionChoice(TypedDict):
-    message: CompletionMessage
-
-
-class CompletionPayload(TypedDict):
-    choices: list[CompletionChoice]
-
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
-STATIC_DIR = BASE_DIR / "static"
+WEB_BUILD_DIR = BASE_DIR / "web" / "build"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+KNOWLEDGE_ASSISTANT_INSTRUCTIONS = "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号，如[1]。不要编造政策、数字或来源。"
 
 
 @asynccontextmanager
@@ -68,10 +47,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Enterprise AI Knowledge Base", version="0.1.0", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 class KnowledgeBaseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+
+
+class ProjectCreate(BaseModel):
+    kb_id: str = Field(default="company", min_length=1, max_length=100)
     name: str = Field(min_length=1, max_length=100)
     description: str = Field(default="", max_length=500)
 
@@ -96,6 +80,7 @@ class DocumentImport(BaseModel):
 
 class ChatCompletion(BaseModel):
     session_id: str = Field(min_length=1, max_length=200)
+    session_token: str = Field(min_length=32, max_length=200)
     question: str = Field(min_length=1, max_length=2000)
     kb_id: str = "company"
     project_id: str = "default"
@@ -173,75 +158,115 @@ async def llm_answer(question: str, sources: list[DictRow], history: list[dict[s
     if not base_url or not api_key:
         return fallback_answer(sources), "local-fallback"
     context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-    messages = [
-        {"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号，如[1]。不要编造政策、数字或来源。"}
-    ]
-    messages.extend(history[-6:])
-    messages.append({"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{question}"})
+    prompt = f"参考资料：\n{context or '无'}\n\n问题：{question}"
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(
-                f"{base_url}/chat/completions", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "messages": messages, "temperature": 0.1}
+                f"{base_url}/responses",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=build_response_request(model, KNOWLEDGE_ASSISTANT_INSTRUCTIONS, build_response_input(history, prompt, 6)),
             )
             _ = response.raise_for_status()
-            payload = cast(CompletionPayload, response.json())
-            return payload["choices"][0]["message"]["content"], model
-    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError):
+            return response_answer_text(cast(object, response.json())), model
+    except (httpx.HTTPError, ValueError):
         return fallback_answer(sources), "local-fallback-after-llm-error"
 
 
-def stream_content(payload: StreamPayload) -> str:
-    if payload.get("type") == "response.output_text.delta":
-        return payload.get("delta", "")
-    choices = payload.get("choices", [])
-    return choices[0].get("delta", {}).get("content", "") if choices else ""
-
-
-async def chat_stream(payload: ChatCompletion, sources: list[DictRow], history: list[dict[str, str]]) -> AsyncIterator[str]:
-    yield f"data: {json.dumps({'type': 'sources', 'sources': [{'filename': s['filename'], 'chunk_index': s['chunk_index'], 'score': s['score']} for s in sources]}, ensure_ascii=False)}\n\n"
-    base_url, api_key, model = os.getenv("LLM_BASE_URL", "").rstrip("/"), os.getenv("LLM_API_KEY", ""), os.getenv("LLM_MODEL", "gpt-4o-mini")
-    if not base_url or not api_key:
-        yield f"data: {json.dumps({'type': 'error', 'message': 'LLM configuration is required'}, ensure_ascii=False)}\n\n"
-        return
-    context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-    messages = [
-        {"role": "system", "content": "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号。"},
-        *history[-12:],
-        {"role": "user", "content": f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"},
-    ]
-    answer = ""
+async def chat_stream(
+    payload: ChatCompletion,
+    sources: list[DictRow],
+    history: list[dict[str, str]],
+    generation_id: str,
+) -> AsyncIterator[str]:
+    # A generation is one persisted user turn plus its eventual assistant turn.
+    # The LLM call is streamed outside the database transaction, so the
+    # generation_id lets the completion step verify that this turn still exists
+    # (and was not cleared or superseded) before saving the assistant response.
+    persisted = False
     try:
-        async with (
-            httpx.AsyncClient(timeout=90) as client,
-            client.stream(
-                "POST",
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={"model": model, "messages": messages, "temperature": 0.1, "stream": True},
-            ) as response,
-        ):
-            _ = response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.startswith("data:") or line[5:].strip() == "[DONE]":
-                    continue
-                try:
-                    delta = stream_content(cast(StreamPayload, json.loads(line[5:].strip())))
-                except json.JSONDecodeError:
-                    continue
-                if delta:
-                    answer += delta
-                    yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
-        if not answer:
-            raise RuntimeError("LLM stream returned no content")
-        postgres_store.add_message(payload.session_id, "assistant", answer)
-        yield 'data: {"type":"done"}\n\n'
-    except (httpx.HTTPError, RuntimeError) as exc:
-        yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
-
-
-@app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+        citations = [
+            {
+                "id": source["id"],
+                "filename": source["filename"],
+                "chunk_index": source["chunk_index"],
+                "score": source["score"],
+                "excerpt": re.sub(r"\s+", " ", row_string(source, "content")).strip()[:300],
+            }
+            for source in sources
+        ]
+        yield f"data: {json.dumps({'type': 'sources', 'sources': citations}, ensure_ascii=False)}\n\n"
+        base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
+        api_key = os.getenv("LLM_API_KEY", "")
+        model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        if not base_url or not api_key:
+            answer = fallback_answer(sources)
+            yield f"data: {json.dumps({'type': 'delta', 'content': answer}, ensure_ascii=False)}\n\n"
+            persisted = postgres_store.add_assistant_if_generation_active(
+                payload.session_id, generation_id, answer, payload.kb_id, payload.project_id, payload.department
+            )
+            if not persisted:
+                yield 'data: {"type":"error","message":"会话已被清除，回答未保存"}\n\n'
+                return
+            yield 'data: {"type":"done"}\n\n'
+            return
+        context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
+        prompt = f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"
+        answer = ""
+        completed = False
+        try:
+            async with (
+                httpx.AsyncClient(timeout=90) as client,
+                client.stream(
+                    "POST",
+                    f"{base_url}/responses",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json=build_response_request(
+                        model,
+                        KNOWLEDGE_ASSISTANT_INSTRUCTIONS,
+                        build_response_input(history, prompt, 12),
+                        stream=True,
+                    ),
+                ) as response,
+            ):
+                _ = response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        raise RuntimeError("LLM Responses stream returned an unexpected [DONE] marker")
+                    try:
+                        upstream_payload = cast(object, json.loads(data))
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("LLM stream returned malformed JSON") from exc
+                    if not isinstance(upstream_payload, dict):
+                        raise RuntimeError("LLM stream returned an invalid event shape")
+                    error_message = stream_error(cast(object, upstream_payload))
+                    if error_message:
+                        raise RuntimeError(f"LLM stream error: {error_message}")
+                    if stream_completed(cast(object, upstream_payload)):
+                        completed = True
+                        break
+                    delta = stream_content(cast(object, upstream_payload))
+                    if delta:
+                        answer += delta
+                        yield f"data: {json.dumps({'type': 'delta', 'content': delta}, ensure_ascii=False)}\n\n"
+            if not completed:
+                raise RuntimeError("LLM stream ended before its completion marker")
+            if not answer:
+                raise RuntimeError("LLM stream returned no content")
+            persisted = postgres_store.add_assistant_if_generation_active(
+                payload.session_id, generation_id, answer, payload.kb_id, payload.project_id, payload.department
+            )
+            if not persisted:
+                yield 'data: {"type":"error","message":"会话已被清除，回答未保存"}\n\n'
+                return
+            yield 'data: {"type":"done"}\n\n'
+        except (httpx.HTTPError, RuntimeError) as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+    finally:
+        if not persisted:
+            postgres_store.rollback_generation(payload.session_id, generation_id)
 
 
 @app.get("/api/health")
@@ -266,10 +291,9 @@ def list_projects(kb_id: str = "company") -> list[JsonObject]:
 
 
 @app.post("/api/projects")
-def create_project(payload: dict[str, str]) -> dict[str, str]:
-    kb_id = payload.get("kb_id", "company")
-    _ = ensure_kb(kb_id)
-    return postgres_store.create_project(kb_id, payload["name"], payload.get("description", ""))
+def create_project(payload: ProjectCreate) -> dict[str, str]:
+    _ = ensure_kb(payload.kb_id)
+    return postgres_store.create_project(payload.kb_id, payload.name, payload.description)
 
 
 @app.post("/api/documents/upload")
@@ -292,20 +316,24 @@ async def upload_document(
         raise HTTPException(422, "文件中没有可索引的文本")
     document_id = uuid.uuid4().hex
     stored_path = UPLOAD_DIR / f"{document_id}-{Path(filename).name}"
-    _ = stored_path.write_bytes(data)
-    return postgres_store.insert_document(
-        kb_id=kb_id,
-        project_id=project_id,
-        document_id=document_id,
-        filename=filename,
-        department=department,
-        parser=parser,
-        pdf_type=pdf_type,
-        pages_needing_ocr=pages_needing_ocr,
-        chunks=chunks,
-        stored_path=str(stored_path),
-        chunking_strategy=chunking_strategy,
-    )
+    try:
+        _ = stored_path.write_bytes(data)
+        return postgres_store.insert_document(
+            kb_id=kb_id,
+            project_id=project_id,
+            document_id=document_id,
+            filename=filename,
+            department=department,
+            parser=parser,
+            pdf_type=pdf_type,
+            pages_needing_ocr=pages_needing_ocr,
+            chunks=chunks,
+            stored_path=str(stored_path),
+            chunking_strategy=chunking_strategy,
+        )
+    except Exception:
+        stored_path.unlink(missing_ok=True)
+        raise
 
 
 @app.get("/api/documents")
@@ -359,17 +387,79 @@ def import_document(payload: DocumentImport) -> JsonObject:
 def chat_completions(payload: ChatCompletion) -> StreamingResponse:
     _ = ensure_kb(payload.kb_id)
     project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
-    history = cast(list[dict[str, str]], postgres_store.list_messages(payload.session_id, 12))
-    sources = postgres_store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
-    postgres_store.add_message(payload.session_id, "user", payload.question)
-    return StreamingResponse(chat_stream(payload, sources, history), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    # session_id identifies the conversation; generation_id identifies this
+    # individual question/answer turn. Keeping them separate prevents a late
+    # stream from writing into a newer or already-cleared conversation.
+    generation_id = uuid.uuid4().hex
+    history_rows = postgres_store.begin_generation(
+        payload.session_id,
+        payload.session_token,
+        payload.question,
+        generation_id,
+        payload.kb_id,
+        project_id,
+        payload.department,
+    )
+    if history_rows is None:
+        raise HTTPException(409, "会话已清除、凭证不匹配或已有生成请求正在进行")
+    history = [{"role": row_string(message, "role"), "content": row_string(message, "content")} for message in history_rows]
+    try:
+        sources = postgres_store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
+    except Exception:
+        postgres_store.rollback_generation(payload.session_id, generation_id)
+        raise
+    resolved_payload = payload.model_copy(update={"project_id": project_id})
+    return StreamingResponse(
+        chat_stream(resolved_payload, sources, history, generation_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/api/v1/chat/history/{session_id}")
-def chat_history(session_id: str) -> JsonObject:
-    return {"session_id": session_id, "messages": [dict(row) for row in postgres_store.list_messages(session_id)]}
+def chat_history(
+    session_id: str,
+    x_session_token: Annotated[str, Header(min_length=32, max_length=200)],
+    kb_id: str = "company",
+    project_id: str = "default",
+    department: str = "general",
+) -> JsonObject:
+    resolved_project_id = row_string(ensure_project(kb_id, project_id), "id")
+    messages = postgres_store.list_messages(session_id, None, kb_id, resolved_project_id, department, x_session_token)
+    return {"session_id": session_id, "messages": [dict(row) for row in messages]}
 
 
 @app.delete("/api/v1/chat/session/{session_id}")
-def clear_chat_session(session_id: str) -> JsonObject:
-    return {"session_id": session_id, "deleted": postgres_store.clear_session(session_id)}
+def clear_chat_session(
+    session_id: str,
+    x_session_token: Annotated[str, Header(min_length=32, max_length=200)],
+    kb_id: str = "company",
+    project_id: str = "default",
+    department: str = "general",
+) -> JsonObject:
+    resolved_project_id = row_string(ensure_project(kb_id, project_id), "id")
+    deleted = postgres_store.clear_session(session_id, kb_id, resolved_project_id, department, x_session_token)
+    return {"session_id": session_id, "deleted": deleted}
+
+
+@app.get("/{path:path}", include_in_schema=False)
+def web_app(path: str) -> FileResponse:
+    """Serve the adapter-static build and fall back to its SPA entry point."""
+    if path == "api" or path.startswith("api/"):
+        raise HTTPException(404, "API route not found")
+
+    index_file = WEB_BUILD_DIR / "index.html"
+    if not index_file.is_file():
+        raise HTTPException(503, "Web UI build is missing; run `make build` before starting the production server")
+
+    build_root = WEB_BUILD_DIR.resolve()
+    requested_file = (WEB_BUILD_DIR / path).resolve()
+    if not requested_file.is_relative_to(build_root):
+        raise HTTPException(404, "Static file not found")
+    if requested_file.is_file():
+        return FileResponse(requested_file)
+    if requested_file.is_dir() and (requested_file / "index.html").is_file():
+        return FileResponse(requested_file / "index.html")
+    if path == "_app" or path.startswith("_app/"):
+        raise HTTPException(404, "Static file not found")
+    return FileResponse(index_file)

@@ -2,7 +2,7 @@ repos:
   - repo: local
     hooks:
       - id: project-check
-        name: project checks
+        name: Python and Web checks
         entry: make check
         language: system
         pass_filenames: false

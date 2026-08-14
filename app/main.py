@@ -312,7 +312,9 @@ async def upload_document(
         raise HTTPException(413, "文件不能超过 10MB")
     filename = file.filename or "document.txt"
     text, parser, pdf_type, pages_needing_ocr = parse_document(filename, data)
-    chunks = chunk_document(text, chunking_strategy)
+    # Semantic chunking embeds candidate boundaries synchronously; keep that
+    # work off the event loop just like the later indexing step.
+    chunks = await run_in_threadpool(chunk_document, text, chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文件中没有可索引的文本")
     document_id = uuid.uuid4().hex
@@ -370,7 +372,9 @@ async def ask(payload: AskRequest) -> JsonObject:
 async def import_document(payload: DocumentImport) -> JsonObject:
     _ = ensure_kb(payload.kb_id)
     project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
-    chunks = chunk_document(payload.content, payload.chunking_strategy)
+    # Semantic chunking can make synchronous embedding requests, so it must
+    # also run in the worker pool before insert_document is scheduled there.
+    chunks = await run_in_threadpool(chunk_document, payload.content, payload.chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文档内容不能为空")
     # Keep the import endpoint non-blocking for the same reason as uploads:

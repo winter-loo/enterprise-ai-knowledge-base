@@ -159,10 +159,10 @@ def fallback_answer(sources: list[DictRow]) -> str:
     if not sources:
         return "知识库中没有找到足够相关的资料，无法基于现有文档可靠回答。"
     excerpts = [re.sub(r"\s+", " ", row_string(source, "content")).strip()[:260] for source in sources[:3]]
-    return "根据知识库中检索到的资料：\n" + "\n".join(f"- {text}" for text in excerpts)
+    return "根据知识库中检索到的资料：\n" + "\n".join(f"[{index + 1}] {text}" for index, text in enumerate(excerpts))
 
 
-def citations_for(sources: list[DictRow]) -> list[dict[str, object]]:
+def citations_with_indexes(sources: list[DictRow]) -> list[dict[str, object]]:
     return [
         {
             "id": source["id"],
@@ -170,9 +170,18 @@ def citations_for(sources: list[DictRow]) -> list[dict[str, object]]:
             "chunk_index": source["chunk_index"],
             "score": source["score"],
             "excerpt": re.sub(r"\s+", " ", row_string(source, "content")).strip()[:300],
+            "citation_index": index + 1,
         }
-        for source in sources
+        for index, source in enumerate(sources)
     ]
+
+
+def cited_sources(answer: str, sources: list[DictRow]) -> list[dict[str, object]]:
+    """Return only the citations the answer actually references via [N] markers."""
+    citations = citations_with_indexes(sources)
+    cited_indexes = [int(match.group(1)) - 1 for match in re.finditer(r"\[(\d+)\]", answer)]
+    valid = sorted({index for index in cited_indexes if 0 <= index < len(sources)})
+    return [citations[index] for index in valid]
 
 
 def resolve_and_search(question: str, kb_id: str, project_id: str, department: str, top_k: int) -> list[DictRow]:
@@ -205,14 +214,15 @@ async def llm_answer(question: str, sources: list[DictRow], history: list[dict[s
 
 async def ask_stream(payload: AskRequest, sources: list[DictRow]) -> AsyncIterator[str]:
     # A stateless retrieval + grounded-answer stream: history is inline input,
-    # and nothing about the conversation is persisted here.
-    yield f"data: {json.dumps({'type': 'sources', 'sources': citations_for(sources)}, ensure_ascii=False)}\n\n"
+    # and nothing about the conversation is persisted here. Citations are sent
+    # after the answer so they can be narrowed to the chunks the answer cites.
     base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
     api_key = os.getenv("LLM_API_KEY", "")
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
     if not base_url or not api_key:
         answer = fallback_answer(sources)
         yield f"data: {json.dumps({'type': 'delta', 'content': answer}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'sources', 'sources': cited_sources(answer, sources)}, ensure_ascii=False)}\n\n"
         yield 'data: {"type":"done"}\n\n'
         return
     context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
@@ -261,6 +271,7 @@ async def ask_stream(payload: AskRequest, sources: list[DictRow]) -> AsyncIterat
             raise RuntimeError("LLM stream ended before its completion marker")
         if not answer:
             raise RuntimeError("LLM stream returned no content")
+        yield f"data: {json.dumps({'type': 'sources', 'sources': cited_sources(answer, sources)}, ensure_ascii=False)}\n\n"
         yield 'data: {"type":"done"}\n\n'
     except (httpx.HTTPError, RuntimeError) as exc:
         yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
@@ -382,8 +393,8 @@ async def ask(payload: AskRequest) -> JsonObject | StreamingResponse:
             headers={"Cache-Control": "no-cache"},
         )
     answer, answer_mode = await llm_answer(payload.question, sources, payload.history)
-    citations = citations_for(sources)
-    return {"answer": answer, "answer_mode": answer_mode, "citations": citations, "retrieved": len(citations)}
+    citations = cited_sources(answer, sources)
+    return {"answer": answer, "answer_mode": answer_mode, "citations": citations, "retrieved": len(sources)}
 
 
 @app.post("/api/v1/document/import")

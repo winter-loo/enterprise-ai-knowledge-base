@@ -77,7 +77,8 @@
 										class="grid size-6 shrink-0 place-items-center rounded-md bg-[var(--signal-soft)] text-[var(--signal)]"
 										><FileTextIcon class="size-3.5" /></span
 									>
-									<span class="truncate text-xs font-semibold">[{index + 1}] {source.filename}</span
+									<span class="truncate text-xs font-semibold"
+										>[{source.citation_index}] {source.filename}</span
 									>
 									<Badge
 										variant="outline"

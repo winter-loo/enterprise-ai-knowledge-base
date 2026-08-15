@@ -164,7 +164,30 @@ async def test_ask_keeps_scope_and_citations(client, monkeypatch):
     body = response.json()
     assert response.status_code == 200
     assert body["citations"][0]["filename"] == "guide.md"
+    assert body["citations"][0]["citation_index"] == 1
     assert body["answer_mode"] == "test-model"
+
+
+@pytest.mark.anyio
+async def test_ask_returns_only_cited_chunks(client, monkeypatch):
+    sources = [
+        {"id": "c1", "filename": "a.md", "chunk_index": 0, "score": 0.9, "content": "内容一", "summary": "s1"},
+        {"id": "c2", "filename": "b.md", "chunk_index": 1, "score": 0.8, "content": "内容二", "summary": "s2"},
+        {"id": "c3", "filename": "c.md", "chunk_index": 2, "score": 0.7, "content": "内容三", "summary": "s3"},
+    ]
+    monkeypatch.setattr(store, "search", lambda *_: sources)
+
+    async def answer(*_):
+        return "根据[1]和[3]作答。", "test-model"
+
+    monkeypatch.setattr("rag.main.llm_answer", answer)
+
+    async with client as http:
+        response = await http.post("/api/ask", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
+
+    body = response.json()
+    assert [citation["citation_index"] for citation in body["citations"]] == [1, 3]
+    assert body["retrieved"] == 3
 
 
 def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
@@ -423,17 +446,20 @@ async def test_ask_stream_accepts_responses_api_completion_event(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_ask_stream_emits_sources_with_ids_and_excerpts(monkeypatch):
+async def test_ask_stream_emits_cited_sources_after_answer(monkeypatch):
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     payload = AskRequest(question="如何重启？", kb_id="company", project_id="p-1", department="engineering")
 
     events = [event async for event in ask_stream(payload, SOURCES)]
 
-    first = json.loads(events[0][6:])
-    assert first["type"] == "sources"
-    assert first["sources"][0]["id"] == "chunk-1"
-    assert first["sources"][0]["excerpt"] == "重启服务前先保存配置。"
+    delta = json.loads(events[0][6:])
+    sources = json.loads(events[1][6:])
+    assert delta["type"] == "delta"
+    assert sources["type"] == "sources"
+    assert sources["sources"][0]["id"] == "chunk-1"
+    assert sources["sources"][0]["excerpt"] == "重启服务前先保存配置。"
+    assert sources["sources"][0]["citation_index"] == 1
 
 
 @pytest.mark.anyio

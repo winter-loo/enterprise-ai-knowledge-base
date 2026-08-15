@@ -106,6 +106,7 @@ export interface Citation {
 	chunk_index: number;
 	score: number;
 	excerpt: string;
+	citation_index: number;
 }
 
 export interface AskResponse {
@@ -162,6 +163,7 @@ export interface ChatSource {
 	chunk_index: number;
 	score: number;
 	excerpt: string;
+	citation_index: number;
 }
 
 export interface ChatSourcesEvent {

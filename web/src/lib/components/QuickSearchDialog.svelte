@@ -122,10 +122,10 @@
 				<MarkdownText content={result.answer} />
 				{#if result.citations.length}
 					<div class="grid gap-2 sm:grid-cols-2">
-						{#each result.citations as citation, index (citation.id)}
+						{#each result.citations as citation (citation.id)}
 							<div class="rounded-xl border border-[var(--line)] bg-white/55 p-4">
 								<div class="flex items-center gap-2 text-xs font-semibold">
-									<FileTextIcon class="size-4 text-[var(--signal)]" />[{index + 1}] {citation.filename}<span
+									<FileTextIcon class="size-4 text-[var(--signal)]" />[{citation.citation_index}] {citation.filename}<span
 										class="ml-auto font-mono text-[10px] text-[var(--ink-faint)]"
 										>{Math.round(citation.score * 100)}%</span
 									>

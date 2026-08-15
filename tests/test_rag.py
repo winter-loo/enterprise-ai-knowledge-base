@@ -139,6 +139,21 @@ async def test_document_import(client):
 
 
 @pytest.mark.anyio
+async def test_scope_resolve_returns_canonical_project(client):
+    async with client as http:
+        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "p-1", "department": "engineering"})
+    assert response.status_code == 200
+    assert response.json() == {"kb_id": "company", "project_id": "p-1", "department": "engineering"}
+
+
+@pytest.mark.anyio
+async def test_scope_resolve_rejects_unknown_project(client):
+    async with client as http:
+        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "other", "department": "engineering"})
+    assert response.status_code == 404
+
+
+@pytest.mark.anyio
 async def test_ask_keeps_scope_and_citations(client, monkeypatch):
     async def answer(*_):
         return "请先保存配置。[1]", "test-model"

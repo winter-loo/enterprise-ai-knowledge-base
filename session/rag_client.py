@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -12,6 +12,27 @@ JsonObject = dict[str, object]
 
 def base_url() -> str:
     return os.getenv("RAG_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
+
+
+def _fastapi_detail(response: httpx.Response) -> str | None:
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = cast(dict[str, object], body).get("detail")
+    return detail if isinstance(detail, str) else None
+
+
+def resolve_scope(kb_id: str, project_id: str, department: str) -> JsonObject:
+    """Canonicalize a scope through the RAG service; raises RuntimeError on a bad scope."""
+    payload = {"kb_id": kb_id, "project_id": project_id, "department": department}
+    with httpx.Client(timeout=10) as client:
+        response = client.post(f"{base_url()}/api/scope/resolve", json=payload)
+    if response.is_error:
+        raise RuntimeError(_fastapi_detail(response) or "RAG 范围解析失败")
+    return cast(JsonObject, response.json())
 
 
 async def ask_stream(

@@ -103,6 +103,10 @@ def client(monkeypatch):
         yield {"type": "done"}
 
     monkeypatch.setattr("session.main.ask_stream", default_ask_stream)
+    monkeypatch.setattr(
+        "session.main.resolve_scope",
+        lambda kb_id, project_id, department: {"kb_id": kb_id, "project_id": project_id, "department": department},
+    )
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
@@ -309,3 +313,22 @@ async def test_rag_error_rolls_back_pending_user_message(client, monkeypatch):
 
     assert '"type": "error"' in response.text
     assert history.json()["messages"] == []
+
+
+@pytest.mark.anyio
+async def test_chat_completions_persists_canonical_project_scope(client, monkeypatch):
+    def resolve(kb_id, project_id, department):
+        return {"kb_id": kb_id, "project_id": "p-1" if project_id == "default" else project_id, "department": department}
+
+    monkeypatch.setattr("session.main.resolve_scope", resolve)
+
+    async with client as http:
+        response = await http.post("/api/v1/chat/completions", json=_payload(session_id="canonical", project_id="default"))
+        history = await http.get(
+            "/api/v1/chat/history/canonical",
+            params={"kb_id": "company", "project_id": "p-1", "department": "engineering"},
+            headers={"x-session-token": "t" * 32},
+        )
+
+    assert response.status_code == 200
+    assert [message["role"] for message in history.json()["messages"]] == ["user", "assistant"]

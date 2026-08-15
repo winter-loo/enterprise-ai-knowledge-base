@@ -78,6 +78,12 @@ class AskRequest(BaseModel):
     stream: bool = False
 
 
+class ScopeResolve(BaseModel):
+    kb_id: str = "company"
+    project_id: str = "default"
+    department: str = "general"
+
+
 class DocumentImport(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     content: str = Field(min_length=1)
@@ -167,6 +173,13 @@ def citations_for(sources: list[DictRow]) -> list[dict[str, object]]:
         }
         for source in sources
     ]
+
+
+def resolve_and_search(question: str, kb_id: str, project_id: str, department: str, top_k: int) -> list[DictRow]:
+    """Resolve a scope and run retrieval in one synchronous worker-pool call."""
+    _ = ensure_kb(kb_id)
+    resolved_project_id = row_string(ensure_project(kb_id, project_id), "id")
+    return store.search(question, kb_id, resolved_project_id, department, top_k)
 
 
 async def llm_answer(question: str, sources: list[DictRow], history: list[dict[str, str]]) -> tuple[str, str]:
@@ -335,9 +348,7 @@ def list_documents(kb_id: str = "company") -> list[JsonObject]:
 
 @app.post("/api/retrieve")
 def retrieve(payload: RetrieveRequest) -> JsonObject:
-    _ = ensure_kb(payload.kb_id)
-    project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
-    sources = store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
+    sources = resolve_and_search(payload.question, payload.kb_id, payload.project_id, payload.department, payload.top_k)
     chunks = [
         {
             "id": source["id"],
@@ -352,11 +363,18 @@ def retrieve(payload: RetrieveRequest) -> JsonObject:
     return {"chunks": chunks, "retrieved": len(chunks)}
 
 
-@app.post("/api/ask", response_model=None)
-async def ask(payload: AskRequest) -> JsonObject | StreamingResponse:
+@app.post("/api/scope/resolve")
+def resolve_scope(payload: ScopeResolve) -> dict[str, str]:
     _ = ensure_kb(payload.kb_id)
     project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
-    sources = store.search(payload.question, payload.kb_id, project_id, payload.department, payload.top_k)
+    return {"kb_id": payload.kb_id, "project_id": project_id, "department": payload.department}
+
+
+@app.post("/api/ask", response_model=None)
+async def ask(payload: AskRequest) -> JsonObject | StreamingResponse:
+    # Retrieval performs synchronous embedding and PostgreSQL calls; keep it off
+    # the event loop so a slow search cannot starve concurrent answer streams.
+    sources = await run_in_threadpool(resolve_and_search, payload.question, payload.kb_id, payload.project_id, payload.department, payload.top_k)
     if payload.stream:
         return StreamingResponse(
             ask_stream(payload, sources),

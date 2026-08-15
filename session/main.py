@@ -13,7 +13,7 @@ from psycopg.rows import DictRow
 from pydantic import BaseModel, Field
 
 from session import store
-from session.rag_client import ask_stream
+from session.rag_client import ask_stream, resolve_scope
 
 JsonObject = dict[str, object]
 
@@ -43,6 +43,14 @@ def row_string(row: DictRow, key: str) -> str:
 
 def sse(event: JsonObject) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def canonical_project_id(kb_id: str, project_id: str, department: str) -> str:
+    try:
+        scope = resolve_scope(kb_id, project_id, department)
+    except RuntimeError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return cast(str, scope["project_id"])
 
 
 async def chat_stream(payload: ChatCompletion, history: list[dict[str, str]], generation_id: str) -> AsyncIterator[str]:
@@ -92,6 +100,9 @@ def health() -> dict[str, str]:
 
 @app.post("/api/v1/chat/completions")
 def chat_completions(payload: ChatCompletion) -> StreamingResponse:
+    # Resolve the scope through RAG before persisting, so the session records
+    # the same canonical project id that retrieval uses ("default" is an alias).
+    resolved_project_id = canonical_project_id(payload.kb_id, payload.project_id, payload.department)
     generation_id = uuid.uuid4().hex
     history_rows = store.begin_generation(
         payload.session_id,
@@ -99,14 +110,15 @@ def chat_completions(payload: ChatCompletion) -> StreamingResponse:
         payload.question,
         generation_id,
         payload.kb_id,
-        payload.project_id,
+        resolved_project_id,
         payload.department,
     )
     if history_rows is None:
         raise HTTPException(409, "会话已清除、凭证不匹配或已有生成请求正在进行")
     history = [{"role": row_string(message, "role"), "content": row_string(message, "content")} for message in history_rows]
+    resolved_payload = payload.model_copy(update={"project_id": resolved_project_id})
     return StreamingResponse(
-        chat_stream(payload, history, generation_id),
+        chat_stream(resolved_payload, history, generation_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
@@ -120,7 +132,8 @@ def chat_history(
     project_id: str = "default",
     department: str = "general",
 ) -> JsonObject:
-    messages = store.list_messages(session_id, None, kb_id, project_id, department, x_session_token)
+    resolved_project_id = canonical_project_id(kb_id, project_id, department)
+    messages = store.list_messages(session_id, None, kb_id, resolved_project_id, department, x_session_token)
     return {"session_id": session_id, "messages": [dict(row) for row in messages]}
 
 
@@ -132,5 +145,6 @@ def clear_chat_session(
     project_id: str = "default",
     department: str = "general",
 ) -> JsonObject:
-    deleted = store.clear_session(session_id, kb_id, project_id, department, x_session_token)
+    resolved_project_id = canonical_project_id(kb_id, project_id, department)
+    deleted = store.clear_session(session_id, kb_id, resolved_project_id, department, x_session_token)
     return {"session_id": session_id, "deleted": deleted}

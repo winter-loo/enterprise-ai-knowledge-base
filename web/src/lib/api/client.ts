@@ -199,10 +199,15 @@ export interface RagApiClient {
 	): Promise<ImportResult>;
 	ask(payload: AskRequest, options?: ApiRequestOptions): Promise<AskResponse>;
 	retrieve(payload: RetrieveRequest, options?: ApiRequestOptions): Promise<RetrieveResponse>;
-	getEvidence(chunkId: string, options?: ApiRequestOptions): Promise<EvidenceDetail>;
+	getEvidence(
+		chunkId: string,
+		scope: ScopePayload,
+		options?: ApiRequestOptions
+	): Promise<EvidenceDetail>;
 }
 
 export interface SessionApiClient {
+	health(options?: ApiRequestOptions): Promise<HealthResponse>;
 	getHistory(
 		sessionId: string,
 		scope: SessionAccess,
@@ -251,8 +256,15 @@ export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
 			jsonRequest('/api/v1/document/import', payload, requestOptions),
 		ask: (payload, requestOptions) => jsonRequest('/api/ask', payload, requestOptions),
 		retrieve: (payload, requestOptions) => jsonRequest('/api/retrieve', payload, requestOptions),
-		getEvidence: (chunkId, requestOptions) =>
-			request(`/api/evidence/${encodeURIComponent(chunkId)}`, { signal: requestOptions?.signal })
+		getEvidence: (chunkId, scope, requestOptions) =>
+			request(
+				`/api/evidence/${encodeURIComponent(chunkId)}?${new URLSearchParams({
+					kb_id: scope.kb_id,
+					project_id: scope.project_id,
+					department: scope.department
+				})}`,
+				{ signal: requestOptions?.signal }
+			)
 	};
 }
 
@@ -260,6 +272,7 @@ export function createSessionClient(options: ApiClientOptions = {}): SessionApiC
 	const { request } = createTransport(options);
 
 	return {
+		health: (requestOptions) => request('/api/v1/chat/health', { signal: requestOptions?.signal }),
 		getHistory: (sessionId, scope, requestOptions) =>
 			request(`/api/v1/chat/history/${encodeURIComponent(sessionId)}?${scopeSearchParams(scope)}`, {
 				headers: { 'x-session-token': scope.session_token },

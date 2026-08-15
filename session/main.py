@@ -98,6 +98,11 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "enterprise-ai-knowledge-base-session"}
 
 
+@app.get("/api/v1/chat/health")
+def chat_health() -> dict[str, str]:
+    return {"status": "ok", "service": "enterprise-ai-knowledge-base-session"}
+
+
 @app.post("/api/v1/chat/completions")
 def chat_completions(payload: ChatCompletion) -> StreamingResponse:
     # Resolve the scope through RAG before persisting, so the session records

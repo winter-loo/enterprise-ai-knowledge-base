@@ -4,6 +4,7 @@
 	import SparklesIcon from '@lucide/svelte/icons/sparkles';
 	import { Badge } from '$lib/components/ui/badge';
 	import type { ChatSource } from '$lib/api/types';
+	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { messageText } from '$lib/chat/sessions';
 	import BrandMark from './BrandMark.svelte';
 	import EvidenceDialog from './EvidenceDialog.svelte';
@@ -12,8 +13,9 @@
 	let {
 		message,
 		streaming = false,
-		incomplete = false
-	}: { message: UIMessage; streaming?: boolean; incomplete?: boolean } = $props();
+		incomplete = false,
+		scope
+	}: { message: UIMessage; streaming?: boolean; incomplete?: boolean; scope: ChatScope } = $props();
 	let text = $derived(messageText(message));
 	let sources = $derived(
 		message.parts.flatMap((part) =>
@@ -110,4 +112,4 @@
 	</article>
 {/if}
 
-<EvidenceDialog bind:open={detailOpen} source={detailSource} />
+<EvidenceDialog bind:open={detailOpen} source={detailSource} {scope} />

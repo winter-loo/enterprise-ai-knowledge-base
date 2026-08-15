@@ -3,12 +3,16 @@
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import { rag } from '$lib/api/client';
 	import type { ChatSource, EvidenceDetail } from '$lib/api/types';
+	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { Badge } from '$lib/components/ui/badge';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import MarkdownText from './MarkdownText.svelte';
 
-	let { open = $bindable(false), source = null }: { open: boolean; source: ChatSource | null } =
-		$props();
+	let {
+		open = $bindable(false),
+		source = null,
+		scope
+	}: { open: boolean; source: ChatSource | null; scope: ChatScope } = $props();
 
 	let detail = $state<EvidenceDetail>();
 	let loading = $state(false);
@@ -22,7 +26,11 @@
 		error = '';
 		loading = true;
 		rag
-			.getEvidence(chunkId)
+			.getEvidence(chunkId, {
+				kb_id: scope.kbId,
+				project_id: scope.projectId,
+				department: scope.department
+			})
 			.then((next) => {
 				if (!cancelled) detail = next;
 			})

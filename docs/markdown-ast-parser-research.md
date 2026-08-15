@@ -89,7 +89,7 @@ root = parse(
 
 ## 接入建议
 
-不要让 `app/chunking.py` 直接依赖第三方节点类型。建议先增加一个项目自己的适配层：
+不要让 `rag/chunking.py` 直接依赖第三方节点类型。建议先增加一个项目自己的适配层：
 
 ```python
 @dataclass(frozen=True)

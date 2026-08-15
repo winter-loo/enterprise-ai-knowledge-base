@@ -11,7 +11,7 @@
 	import SearchIcon from '@lucide/svelte/icons/search';
 	import SparklesIcon from '@lucide/svelte/icons/sparkles';
 	import type { DocumentRecord, KnowledgeBase, Project } from '$lib/api/types';
-	import { api } from '$lib/api/client';
+	import { rag, session as sessionApi } from '$lib/api/client';
 	import { PythonSseChatTransport, type PythonChatMessage } from '$lib/ai/python-sse-transport';
 	import {
 		createLocalSession,
@@ -187,7 +187,7 @@
 		ready = false;
 		serviceState = 'checking';
 		try {
-			const [health, kbs] = await Promise.all([api.health(), api.listKnowledgeBases()]);
+			const [health, kbs] = await Promise.all([rag.health(), rag.listKnowledgeBases()]);
 			const nextSessions = readSessions();
 			let remembered = nextSessions.find((session) => session.id === readActiveSessionId());
 			const nextKbId = kbs.some((kb) => kb.id === remembered?.scope.kbId)
@@ -196,8 +196,8 @@
 			if (!nextKbId) throw new Error('服务端没有可用的知识库');
 
 			const [nextProjects, nextDocuments] = await Promise.all([
-				api.listProjects(nextKbId),
-				api.listDocuments(nextKbId)
+				rag.listProjects(nextKbId),
+				rag.listDocuments(nextKbId)
 			]);
 			const nextProjectId = nextProjects.some(
 				(project) => project.id === remembered?.scope.projectId
@@ -215,7 +215,7 @@
 			let restoredMessages: PythonChatMessage[] | undefined;
 			if (remembered && !shouldStartNewSession(remembered.scope, resolvedScope)) {
 				try {
-					const history = await api.getHistory(
+					const history = await sessionApi.getHistory(
 						remembered.id,
 						apiScope(remembered.scope, remembered.token)
 					);
@@ -278,7 +278,7 @@
 	});
 
 	async function refreshDocuments(): Promise<void> {
-		if (kbId) documents = await api.listDocuments(kbId);
+		if (kbId) documents = await rag.listDocuments(kbId);
 	}
 
 	async function changeKnowledgeBase(value: string): Promise<void> {
@@ -286,8 +286,8 @@
 		const request = beginScopeRequest();
 		try {
 			const [nextProjects, nextDocuments] = await Promise.all([
-				api.listProjects(value, { signal: request.signal }),
-				api.listDocuments(value, { signal: request.signal })
+				rag.listProjects(value, { signal: request.signal }),
+				rag.listDocuments(value, { signal: request.signal })
 			]);
 			if (request.id !== scopeRequestId) return;
 			const nextProjectId = nextProjects[0]?.id ?? '';
@@ -327,9 +327,9 @@
 		const request = beginScopeRequest();
 		try {
 			const [nextProjects, nextDocuments, history] = await Promise.all([
-				api.listProjects(session.scope.kbId, { signal: request.signal }),
-				api.listDocuments(session.scope.kbId, { signal: request.signal }),
-				api.getHistory(session.id, apiScope(session.scope, session.token), {
+				rag.listProjects(session.scope.kbId, { signal: request.signal }),
+				rag.listDocuments(session.scope.kbId, { signal: request.signal }),
+				sessionApi.getHistory(session.id, apiScope(session.scope, session.token), {
 					signal: request.signal
 				})
 			]);
@@ -371,7 +371,7 @@
 		try {
 			cancelScopeRequest();
 			if (session.id === activeSession.id && isGenerating) await chat.stop();
-			await api.clearSession(session.id, apiScope(session.scope, session.token));
+			await sessionApi.clearSession(session.id, apiScope(session.scope, session.token));
 			if (!removeStoredSession(session.id)) {
 				toast.warning('服务器会话已删除，但浏览器未能更新本地列表；刷新后可再次清理条目');
 				return;
@@ -450,14 +450,14 @@
 		let createdScope: ChatScope;
 		try {
 			if (createKind === 'knowledge-base') {
-				const created = await api.createKnowledgeBase({ name, description });
+				const created = await rag.createKnowledgeBase({ name, description });
 				createdScope = {
 					kbId: created.id,
 					projectId: created.default_project_id,
 					department
 				};
 			} else {
-				const created = await api.createProject({ kb_id: kbId, name, description });
+				const created = await rag.createProject({ kb_id: kbId, name, description });
 				createdScope = { kbId, projectId: created.id, department };
 			}
 		} catch (error) {
@@ -507,8 +507,8 @@
 		const refreshSessionId = activeSession.id;
 		try {
 			const [nextKbs, nextProjects] = await Promise.all([
-				api.listKnowledgeBases(),
-				api.listProjects(createdScope.kbId)
+				rag.listKnowledgeBases(),
+				rag.listProjects(createdScope.kbId)
 			]);
 			knowledgeBases = nextKbs;
 			if (activeSession.id === refreshSessionId && kbId === createdScope.kbId) {

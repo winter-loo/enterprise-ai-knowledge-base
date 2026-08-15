@@ -28,7 +28,8 @@ function isChatSource(value: unknown): value is ChatSource {
 		typeof value.filename === 'string' &&
 		typeof value.chunk_index === 'number' &&
 		typeof value.score === 'number' &&
-		typeof value.excerpt === 'string'
+		typeof value.excerpt === 'string' &&
+		typeof value.citation_index === 'number'
 	);
 }
 

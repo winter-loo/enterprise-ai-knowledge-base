@@ -2,7 +2,7 @@ from itertools import pairwise
 
 import pytest
 
-from app.chunking import _encoding, _sentences, _token_count, _token_tail, chunk_text
+from rag.chunking import _encoding, _sentences, _token_count, _token_tail, chunk_text
 
 
 def _first_tokens(text: str, count: int) -> str:

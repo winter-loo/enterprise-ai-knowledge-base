@@ -4,14 +4,15 @@
 	import FileTextIcon from '@lucide/svelte/icons/file-text';
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import SearchIcon from '@lucide/svelte/icons/search';
-	import type { AskResponse, ChatPromptMessage } from '$lib/api/types';
-	import { api } from '$lib/api/client';
+	import type { AskResponse, ChatPromptMessage, ChatSource } from '$lib/api/types';
+	import { rag } from '$lib/api/client';
 	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Label } from '$lib/components/ui/label';
 	import { Textarea } from '$lib/components/ui/textarea';
+	import EvidenceDialog from './EvidenceDialog.svelte';
 	import MarkdownText from './MarkdownText.svelte';
 
 	let {
@@ -25,6 +26,8 @@
 	let result = $state<AskResponse>();
 	let requestController: AbortController | undefined;
 	let previousScopeKey = '';
+	let detailOpen = $state(false);
+	let detailSource = $state<ChatSource | null>(null);
 
 	function cancelSearch(): void {
 		requestController?.abort();
@@ -50,7 +53,7 @@
 		loading = true;
 		result = undefined;
 		try {
-			const nextResult = await api.ask(
+			const nextResult = await rag.ask(
 				{
 					question: question.trim(),
 					kb_id: scope.kbId,
@@ -122,16 +125,23 @@
 				<MarkdownText content={result.answer} />
 				{#if result.citations.length}
 					<div class="grid gap-2 sm:grid-cols-2">
-						{#each result.citations as citation, index (citation.id)}
-							<div class="rounded-xl border border-[var(--line)] bg-white/55 p-4">
+						{#each result.citations as citation (citation.id)}
+							<button
+								type="button"
+								class="rounded-xl border border-[var(--line)] bg-white/55 p-4 text-left transition hover:border-[var(--signal)] hover:bg-white/80"
+								onclick={() => {
+									detailSource = citation;
+									detailOpen = true;
+								}}
+							>
 								<div class="flex items-center gap-2 text-xs font-semibold">
-									<FileTextIcon class="size-4 text-[var(--signal)]" />[{index + 1}] {citation.filename}<span
+									<FileTextIcon class="size-4 text-[var(--signal)]" />[{citation.citation_index}] {citation.filename}<span
 										class="ml-auto font-mono text-[10px] text-[var(--ink-faint)]"
 										>{Math.round(citation.score * 100)}%</span
 									>
 								</div>
 								<p class="mt-2 text-xs leading-5 text-[var(--ink-muted)]">{citation.excerpt}</p>
-							</div>
+							</button>
 						{/each}
 					</div>
 				{/if}
@@ -139,3 +149,5 @@
 		{/if}
 	</Dialog.Content>
 </Dialog.Root>
+
+<EvidenceDialog bind:open={detailOpen} source={detailSource} />

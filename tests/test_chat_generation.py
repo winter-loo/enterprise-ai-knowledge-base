@@ -1,4 +1,4 @@
-from app import postgres_store
+from session import store
 
 
 class QueryResult:
@@ -28,7 +28,7 @@ class StaleGenerationConnection:
         normalized = " ".join(str(query).split())
         self.queries.append(normalized)
         if normalized.startswith("DELETE FROM chat_messages") and "make_interval" in normalized:
-            assert params[-1] == postgres_store.GENERATION_LEASE_SECONDS
+            assert params[-1] == store.GENERATION_LEASE_SECONDS
             self.stale_pending = False
         if normalized.startswith("SELECT 1 FROM chat_messages") and "generation_complete=FALSE" in normalized:
             return QueryResult({"exists": 1} if self.stale_pending else None)
@@ -40,9 +40,9 @@ class StaleGenerationConnection:
 
 def test_stale_generation_lease_is_reclaimed_before_active_check(monkeypatch):
     connection = StaleGenerationConnection()
-    monkeypatch.setattr(postgres_store, "connect", lambda: connection)
+    monkeypatch.setattr(store, "connect", lambda: connection)
 
-    history = postgres_store.begin_generation(
+    history = store.begin_generation(
         "session-1",
         "t" * 32,
         "retry after crash",

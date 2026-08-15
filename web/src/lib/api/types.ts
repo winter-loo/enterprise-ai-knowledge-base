@@ -106,6 +106,7 @@ export interface Citation {
 	chunk_index: number;
 	score: number;
 	excerpt: string;
+	citation_index: number;
 }
 
 export interface AskResponse {
@@ -113,6 +114,41 @@ export interface AskResponse {
 	answer_mode: string;
 	citations: Citation[];
 	retrieved: number;
+}
+
+export interface RetrieveChunk {
+	id: string;
+	filename: string;
+	chunk_index: number;
+	score: number;
+	content: string;
+	summary: string;
+}
+
+export interface RetrieveRequest extends ScopePayload {
+	question: string;
+	top_k?: number;
+}
+
+export interface RetrieveResponse {
+	chunks: RetrieveChunk[];
+	retrieved: number;
+}
+
+export interface EvidenceDetail {
+	id: string;
+	filename: string;
+	chunk_index: number;
+	content: string;
+	summary: string;
+	department: string;
+	project_id: string;
+	document_id: string;
+	source_type: string;
+	source_uri: string;
+	page: number | null;
+	metadata: Record<string, unknown>;
+	created_at: string;
 }
 
 export interface ChatCompletionRequest extends ScopePayload {
@@ -143,6 +179,7 @@ export interface ChatSource {
 	chunk_index: number;
 	score: number;
 	excerpt: string;
+	citation_index: number;
 }
 
 export interface ChatSourcesEvent {

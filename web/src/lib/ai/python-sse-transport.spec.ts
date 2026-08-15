@@ -35,7 +35,8 @@ describe('Python SSE to AI SDK stream', () => {
 			filename: 'guide.md',
 			chunk_index: 0,
 			score: 0.91,
-			excerpt: '重启前保存配置。'
+			excerpt: '重启前保存配置。',
+			citation_index: 1
 		};
 		const wire = [
 			`data: ${JSON.stringify({ type: 'sources', sources: [source] })}\r\n\r\n`,

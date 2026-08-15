@@ -332,3 +332,12 @@ async def test_chat_completions_persists_canonical_project_scope(client, monkeyp
 
     assert response.status_code == 200
     assert [message["role"] for message in history.json()["messages"]] == ["user", "assistant"]
+
+
+@pytest.mark.anyio
+async def test_session_chat_health(client):
+    async with client as http:
+        response = await http.get("/api/v1/chat/health")
+
+    assert response.status_code == 200
+    assert response.json()["service"] == "enterprise-ai-knowledge-base-session"

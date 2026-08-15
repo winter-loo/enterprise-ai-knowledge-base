@@ -187,7 +187,11 @@
 		ready = false;
 		serviceState = 'checking';
 		try {
-			const [health, kbs] = await Promise.all([rag.health(), rag.listKnowledgeBases()]);
+			const [health, sessionHealth, kbs] = await Promise.all([
+				rag.health(),
+				sessionApi.health(),
+				rag.listKnowledgeBases()
+			]);
 			const nextSessions = readSessions();
 			let remembered = nextSessions.find((session) => session.id === readActiveSessionId());
 			const nextKbId = kbs.some((kb) => kb.id === remembered?.scope.kbId)
@@ -234,7 +238,7 @@
 			department = nextDepartment;
 			if (remembered && restoredMessages) setActiveSession(remembered, restoredMessages);
 			else if (!newSession(resolvedScope)) throw new Error('无法持久化安全会话，工作台未启用');
-			serviceState = health.status === 'ok' ? 'online' : 'offline';
+			serviceState = health.status === 'ok' && sessionHealth.status === 'ok' ? 'online' : 'offline';
 			ready = true;
 		} catch (error) {
 			serviceState = 'offline';
@@ -670,6 +674,7 @@
 						{#each chat.messages as message, index (message.id)}
 							<MessageBubble
 								{message}
+								{scope}
 								incomplete={(chat.status === 'error' &&
 									index === chat.messages.length - 1 &&
 									message.role === 'assistant') ||

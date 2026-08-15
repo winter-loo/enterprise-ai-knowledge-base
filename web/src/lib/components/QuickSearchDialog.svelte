@@ -150,4 +150,4 @@
 	</Dialog.Content>
 </Dialog.Root>
 
-<EvidenceDialog bind:open={detailOpen} source={detailSource} />
+<EvidenceDialog bind:open={detailOpen} source={detailSource} {scope} />

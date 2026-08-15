@@ -358,8 +358,12 @@ def list_documents(kb_id: str = "company") -> list[JsonObject]:
 
 
 @app.get("/api/evidence/{chunk_id}")
-def get_evidence(chunk_id: str) -> JsonObject:
-    row = store.get_evidence(chunk_id)
+def get_evidence(chunk_id: str, kb_id: str, project_id: str, department: str) -> JsonObject:
+    # Enforce the same scope predicate as retrieval so a chunk id alone cannot
+    # read full content from another project or department.
+    _ = ensure_kb(kb_id)
+    resolved_project_id = row_string(ensure_project(kb_id, project_id), "id")
+    row = store.get_evidence(chunk_id, kb_id, resolved_project_id, department)
     if not row:
         raise HTTPException(404, "参考资料片段不存在")
     return dict(row)

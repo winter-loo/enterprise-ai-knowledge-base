@@ -158,7 +158,7 @@ async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
     monkeypatch.setattr(
         store,
         "get_evidence",
-        lambda chunk_id: {
+        lambda chunk_id, kb_id, project_id, department: {
             "id": chunk_id,
             "filename": "guide.md",
             "chunk_index": 0,
@@ -176,7 +176,10 @@ async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
     )
 
     async with client as http:
-        response = await http.get("/api/evidence/chunk-1")
+        response = await http.get(
+            "/api/evidence/chunk-1",
+            params={"kb_id": "company", "project_id": "p-1", "department": "engineering"},
+        )
 
     assert response.status_code == 200
     assert response.json()["content"] == "完整内容"
@@ -185,10 +188,13 @@ async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
 
 @pytest.mark.anyio
 async def test_evidence_returns_404_for_unknown_chunk(client, monkeypatch):
-    monkeypatch.setattr(store, "get_evidence", lambda chunk_id: None)
+    monkeypatch.setattr(store, "get_evidence", lambda chunk_id, kb_id, project_id, department: None)
 
     async with client as http:
-        response = await http.get("/api/evidence/missing")
+        response = await http.get(
+            "/api/evidence/missing",
+            params={"kb_id": "company", "project_id": "p-1", "department": "engineering"},
+        )
 
     assert response.status_code == 404
 

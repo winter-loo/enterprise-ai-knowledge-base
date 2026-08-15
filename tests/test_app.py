@@ -6,6 +6,7 @@ import pytest
 from psycopg._queries import _split_query
 
 from app import postgres_store
+from app.chunking import _token_count
 from app.main import ChatCompletion, app, chat_stream, llm_answer, split_text, stream_content
 from app.openai_responses import response_answer_text
 
@@ -154,9 +155,9 @@ def client(monkeypatch):
 
 
 def test_split_text_overlaps_chunks():
-    chunks = split_text("a" * 1000)
+    chunks = split_text("知识库" * 400)  # 800 token > 默认 size 700, 会切成两片
     assert len(chunks) == 2
-    assert chunks[0][-100:] == chunks[1][:100]
+    assert all(_token_count(chunk) <= 700 for chunk in chunks)
 
 
 @pytest.mark.anyio

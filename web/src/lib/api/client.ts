@@ -16,6 +16,8 @@ import type {
 	Project,
 	ProjectCreateRequest,
 	ProjectCreateResponse,
+	RetrieveRequest,
+	RetrieveResponse,
 	ScopePayload,
 	UploadDocumentRequest,
 	ValidationIssue
@@ -105,41 +107,6 @@ export async function apiErrorFromResponse(response: Response): Promise<ApiError
 	});
 }
 
-export interface ApiClient {
-	health(options?: ApiRequestOptions): Promise<HealthResponse>;
-	listKnowledgeBases(options?: ApiRequestOptions): Promise<KnowledgeBase[]>;
-	createKnowledgeBase(
-		payload: KnowledgeBaseCreateRequest,
-		options?: ApiRequestOptions
-	): Promise<KnowledgeBaseCreateResponse>;
-	listProjects(kbId: string, options?: ApiRequestOptions): Promise<Project[]>;
-	createProject(
-		payload: ProjectCreateRequest,
-		options?: ApiRequestOptions
-	): Promise<ProjectCreateResponse>;
-	listDocuments(kbId: string, options?: ApiRequestOptions): Promise<DocumentRecord[]>;
-	uploadDocument(
-		file: File,
-		payload: UploadDocumentRequest,
-		options?: ApiRequestOptions
-	): Promise<ImportResult>;
-	importDocument(
-		payload: DocumentImportRequest,
-		options?: ApiRequestOptions
-	): Promise<ImportResult>;
-	ask(payload: AskRequest, options?: ApiRequestOptions): Promise<AskResponse>;
-	getHistory(
-		sessionId: string,
-		scope: SessionAccess,
-		options?: ApiRequestOptions
-	): Promise<ChatHistoryResponse>;
-	clearSession(
-		sessionId: string,
-		scope: SessionAccess,
-		options?: ApiRequestOptions
-	): Promise<ClearSessionResponse>;
-}
-
 function joinUrl(baseUrl: string, path: string): string {
 	return `${baseUrl.replace(/\/$/, '')}${path}`;
 }
@@ -152,7 +119,12 @@ function scopeSearchParams(scope: SessionAccess): URLSearchParams {
 	});
 }
 
-export function createApiClient(options: ApiClientOptions = {}): ApiClient {
+interface RequestTransport {
+	request<T>(path: string, init?: RequestInit): Promise<T>;
+	jsonRequest<T>(path: string, payload: object, requestOptions?: ApiRequestOptions): Promise<T>;
+}
+
+function createTransport(options: ApiClientOptions): RequestTransport {
 	const baseUrl = options.baseUrl ?? '';
 	const fetchResponse = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
 
@@ -199,6 +171,51 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
 		});
 	}
 
+	return { request, jsonRequest };
+}
+
+export interface RagApiClient {
+	health(options?: ApiRequestOptions): Promise<HealthResponse>;
+	listKnowledgeBases(options?: ApiRequestOptions): Promise<KnowledgeBase[]>;
+	createKnowledgeBase(
+		payload: KnowledgeBaseCreateRequest,
+		options?: ApiRequestOptions
+	): Promise<KnowledgeBaseCreateResponse>;
+	listProjects(kbId: string, options?: ApiRequestOptions): Promise<Project[]>;
+	createProject(
+		payload: ProjectCreateRequest,
+		options?: ApiRequestOptions
+	): Promise<ProjectCreateResponse>;
+	listDocuments(kbId: string, options?: ApiRequestOptions): Promise<DocumentRecord[]>;
+	uploadDocument(
+		file: File,
+		payload: UploadDocumentRequest,
+		options?: ApiRequestOptions
+	): Promise<ImportResult>;
+	importDocument(
+		payload: DocumentImportRequest,
+		options?: ApiRequestOptions
+	): Promise<ImportResult>;
+	ask(payload: AskRequest, options?: ApiRequestOptions): Promise<AskResponse>;
+	retrieve(payload: RetrieveRequest, options?: ApiRequestOptions): Promise<RetrieveResponse>;
+}
+
+export interface SessionApiClient {
+	getHistory(
+		sessionId: string,
+		scope: SessionAccess,
+		options?: ApiRequestOptions
+	): Promise<ChatHistoryResponse>;
+	clearSession(
+		sessionId: string,
+		scope: SessionAccess,
+		options?: ApiRequestOptions
+	): Promise<ClearSessionResponse>;
+}
+
+export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
+	const { request, jsonRequest } = createTransport(options);
+
 	return {
 		health: (requestOptions) => request('/api/health', { signal: requestOptions?.signal }),
 		listKnowledgeBases: (requestOptions) =>
@@ -231,6 +248,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
 		importDocument: (payload, requestOptions) =>
 			jsonRequest('/api/v1/document/import', payload, requestOptions),
 		ask: (payload, requestOptions) => jsonRequest('/api/ask', payload, requestOptions),
+		retrieve: (payload, requestOptions) => jsonRequest('/api/retrieve', payload, requestOptions)
+	};
+}
+
+export function createSessionClient(options: ApiClientOptions = {}): SessionApiClient {
+	const { request } = createTransport(options);
+
+	return {
 		getHistory: (sessionId, scope, requestOptions) =>
 			request(`/api/v1/chat/history/${encodeURIComponent(sessionId)}?${scopeSearchParams(scope)}`, {
 				headers: { 'x-session-token': scope.session_token },
@@ -245,6 +270,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
 	};
 }
 
-export const api = createApiClient();
+export const rag = createRagClient();
+export const session = createSessionClient();
 
 export type { ApiErrorResponse };

@@ -115,6 +115,25 @@ export interface AskResponse {
 	retrieved: number;
 }
 
+export interface RetrieveChunk {
+	id: string;
+	filename: string;
+	chunk_index: number;
+	score: number;
+	content: string;
+	summary: string;
+}
+
+export interface RetrieveRequest extends ScopePayload {
+	question: string;
+	top_k?: number;
+}
+
+export interface RetrieveResponse {
+	chunks: RetrieveChunk[];
+	retrieved: number;
+}
+
 export interface ChatCompletionRequest extends ScopePayload {
 	session_id: string;
 	question: string;

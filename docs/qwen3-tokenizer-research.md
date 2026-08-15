@@ -48,6 +48,6 @@ Qwen 的 OpenAI 兼容 `/v1/embeddings` 接口会自动加一个 EOS token。空
 
 ## 对当前项目的影响
 
-当前 `app/chunking.py` 使用 `o200k_base` 仍然可以作为一个稳定、项目自有的 **Chunk Tokenizer**，用于控制检索片段粒度；但它不能同时被称为 Qwen3 Embedding 的精确 tokenizer。
+当前 `rag/chunking.py` 使用 `o200k_base` 仍然可以作为一个稳定、项目自有的 **Chunk Tokenizer**，用于控制检索片段粒度；但它不能同时被称为 Qwen3 Embedding 的精确 tokenizer。
 
 如果 `size` 的业务含义是“Qwen3 实际接收的 token 硬上限”，应该改用随 embedding 模型配置的真实 tokenizer，或在提交给 embedding 服务前用该 tokenizer 再做最终校验。如果 `size` 只是稳定的检索分块尺度，则可以继续使用 `o200k_base`，但应明确它是项目选定的计量标准，而不是模型的原生计量标准。

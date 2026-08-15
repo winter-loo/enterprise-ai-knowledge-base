@@ -8,7 +8,7 @@
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import SearchIcon from '@lucide/svelte/icons/search';
 	import type { ChunkingStrategy, DocumentRecord, ImportResult } from '$lib/api/types';
-	import { api } from '$lib/api/client';
+	import { rag } from '$lib/api/client';
 	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
@@ -70,7 +70,7 @@
 		busy = true;
 		let result: ImportResult;
 		try {
-			result = await api.uploadDocument(file, {
+			result = await rag.uploadDocument(file, {
 				kb_id: scope.kbId,
 				project_id: scope.projectId,
 				department: scope.department,
@@ -107,7 +107,7 @@
 		busy = true;
 		let result: ImportResult;
 		try {
-			result = await api.importDocument({
+			result = await rag.importDocument({
 				title: title.trim(),
 				content: content.trim(),
 				kb_id: scope.kbId,

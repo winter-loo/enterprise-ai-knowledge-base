@@ -1,8 +1,10 @@
-# Knowledge Chunking
+# Enterprise AI Knowledge Base
 
-This context defines the language used when source documents are divided into retrieval units while preserving useful continuity between them.
+This context defines the language of the knowledge base: how source documents are divided into retrieval units, and how retrieval, grounded answers, and conversation state are separated.
 
 ## Language
+
+### Knowledge Chunking
 
 **Chunk**:
 A retrieval unit produced from a contiguous portion of a source document.
@@ -35,3 +37,29 @@ _Avoid_: Split point, separator
 **Semantic Coverage**:
 The requirement that every meaningful part of a source document appears in at least one Chunk without reordering content or joining previously separated content without a suitable delimiter. Exact reconstruction and preservation of purely presentational whitespace are not required.
 _Avoid_: Source Coverage, lossless reconstruction, completeness
+
+### Retrieval & Conversation
+
+**Scope**:
+The triple (kb_id, project_id, department) that bounds which knowledge evidence a query may retrieve. Project controls the relevance boundary; department controls the access boundary; the two are not interchangeable.
+_Avoid_: 权限范围, context, boundary
+
+**Retrieve**:
+A stateless primitive that turns a query into ranked Chunks from the knowledge base. It performs no generation and persists nothing.
+_Avoid_: search, query, lookup
+
+**Ask**:
+A stateless primitive that turns a query plus inline History into a grounded answer with Citations. It can be streamed or returned whole, and it persists no conversation state.
+_Avoid_: chat, generate, answer as a verb
+
+**Citation**:
+A reference attached to a grounded answer identifying the Chunk it was drawn from, such as its id, filename, chunk index, score, and excerpt.
+_Avoid_: source, reference, footnote
+
+**Session**:
+The identity and message History of one conversation, owned by the session service. The RAG service has no knowledge of Sessions.
+_Avoid_: chat, conversation, thread
+
+**History**:
+The list of prior role/content messages a caller passes inline to Ask. The RAG service reads it but never stores it.
+_Avoid_: context, memory, transcript

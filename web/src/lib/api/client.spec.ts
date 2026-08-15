@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, createApiClient } from './client';
+import { ApiError, createRagClient, createSessionClient } from './client';
 
 describe('API errors', () => {
 	afterEach(() => {
@@ -14,7 +14,7 @@ describe('API errors', () => {
 				headers: { 'content-type': 'application/json' }
 			})
 		);
-		const client = createApiClient({ fetch });
+		const client = createRagClient({ fetch });
 
 		await expect(client.listProjects('missing')).rejects.toMatchObject({
 			name: 'ApiError',
@@ -44,7 +44,7 @@ describe('API errors', () => {
 				{ status: 422, headers: { 'content-type': 'application/json' } }
 			)
 		);
-		const client = createApiClient({ fetch });
+		const client = createRagClient({ fetch });
 
 		await expect(client.createKnowledgeBase({ name: '' })).rejects.toThrow(
 			'body.name: String should have at least 1 character; body.top_k: Input should be less than or equal to 10'
@@ -57,7 +57,7 @@ describe('API errors', () => {
 			.mockResolvedValue(
 				new Response('Database unavailable', { status: 500, statusText: 'Internal Server Error' })
 			);
-		const client = createApiClient({ fetch });
+		const client = createRagClient({ fetch });
 
 		await expect(client.health()).rejects.toMatchObject({
 			status: 500,
@@ -77,7 +77,7 @@ describe('synchronous ask requests', () => {
 					{ status: 200, headers: { 'content-type': 'application/json' } }
 				)
 			);
-		const client = createApiClient({ fetch });
+		const client = createRagClient({ fetch });
 		const controller = new AbortController();
 		const history = [
 			{ role: 'user' as const, content: '上一轮问题' },
@@ -113,7 +113,7 @@ describe('persistent chat sessions', () => {
 			.mockResolvedValueOnce(
 				new Response(JSON.stringify({ session_id: 's-1', deleted: 0 }), { status: 200 })
 			);
-		const client = createApiClient({ fetch });
+		const client = createSessionClient({ fetch });
 		const scope = {
 			kb_id: 'company',
 			project_id: 'p-1',

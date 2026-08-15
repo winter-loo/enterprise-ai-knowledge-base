@@ -5,7 +5,7 @@
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import SearchIcon from '@lucide/svelte/icons/search';
 	import type { AskResponse, ChatPromptMessage } from '$lib/api/types';
-	import { api } from '$lib/api/client';
+	import { rag } from '$lib/api/client';
 	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
@@ -50,7 +50,7 @@
 		loading = true;
 		result = undefined;
 		try {
-			const nextResult = await api.ask(
+			const nextResult = await rag.ask(
 				{
 					question: question.trim(),
 					kb_id: scope.kbId,

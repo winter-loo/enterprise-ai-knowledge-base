@@ -31,7 +31,7 @@ from functools import lru_cache
 
 import tiktoken
 
-from app.markdown_ast import MarkdownBlock, parse_markdown_blocks
+from rag.markdown_ast import MarkdownBlock, parse_markdown_blocks
 
 Embedder = Callable[[list[str]], list[list[float]]]
 STRATEGIES = {"fixed", "recursive", "semantic", "paragraph"}

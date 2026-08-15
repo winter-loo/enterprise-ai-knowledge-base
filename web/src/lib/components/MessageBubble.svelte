@@ -6,6 +6,7 @@
 	import type { ChatSource } from '$lib/api/types';
 	import { messageText } from '$lib/chat/sessions';
 	import BrandMark from './BrandMark.svelte';
+	import EvidenceDialog from './EvidenceDialog.svelte';
 	import MarkdownText from './MarkdownText.svelte';
 
 	let {
@@ -19,6 +20,8 @@
 			part.type === 'data-sources' ? ((part.data as ChatSource[]) ?? []) : []
 		)
 	);
+	let detailOpen = $state(false);
+	let detailSource = $state<ChatSource | null>(null);
 </script>
 
 {#if message.role === 'user'}
@@ -71,7 +74,14 @@
 					</div>
 					<div class="grid gap-2 sm:grid-cols-2">
 						{#each sources as source, index (`${source.filename}-${source.chunk_index}-${index}`)}
-							<div class="source-card rounded-xl border border-[var(--line)] bg-white/55 p-3.5">
+							<button
+								type="button"
+								class="source-card rounded-xl border border-[var(--line)] bg-white/55 p-3.5 text-left transition hover:border-[var(--signal)] hover:bg-white/80"
+								onclick={() => {
+									detailSource = source;
+									detailOpen = true;
+								}}
+							>
 								<div class="flex min-w-0 items-center gap-2">
 									<span
 										class="grid size-6 shrink-0 place-items-center rounded-md bg-[var(--signal-soft)] text-[var(--signal)]"
@@ -91,7 +101,7 @@
 										{source.excerpt}
 									</p>
 								{/if}
-							</div>
+							</button>
 						{/each}
 					</div>
 				</div>
@@ -99,3 +109,5 @@
 		</div>
 	</article>
 {/if}
+
+<EvidenceDialog bind:open={detailOpen} source={detailSource} />

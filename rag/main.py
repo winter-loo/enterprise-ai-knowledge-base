@@ -357,6 +357,14 @@ def list_documents(kb_id: str = "company") -> list[JsonObject]:
     return [dict(row) for row in store.list_documents(kb_id)]
 
 
+@app.get("/api/evidence/{chunk_id}")
+def get_evidence(chunk_id: str) -> JsonObject:
+    row = store.get_evidence(chunk_id)
+    if not row:
+        raise HTTPException(404, "参考资料片段不存在")
+    return dict(row)
+
+
 @app.post("/api/retrieve")
 def retrieve(payload: RetrieveRequest) -> JsonObject:
     sources = resolve_and_search(payload.question, payload.kb_id, payload.project_id, payload.department, payload.top_k)

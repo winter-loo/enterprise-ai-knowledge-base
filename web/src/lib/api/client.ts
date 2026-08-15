@@ -6,6 +6,7 @@ import type {
 	ClearSessionResponse,
 	DocumentImportRequest,
 	DocumentRecord,
+	EvidenceDetail,
 	FastApiDetailError,
 	FastApiValidationError,
 	HealthResponse,
@@ -198,6 +199,7 @@ export interface RagApiClient {
 	): Promise<ImportResult>;
 	ask(payload: AskRequest, options?: ApiRequestOptions): Promise<AskResponse>;
 	retrieve(payload: RetrieveRequest, options?: ApiRequestOptions): Promise<RetrieveResponse>;
+	getEvidence(chunkId: string, options?: ApiRequestOptions): Promise<EvidenceDetail>;
 }
 
 export interface SessionApiClient {
@@ -248,7 +250,9 @@ export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
 		importDocument: (payload, requestOptions) =>
 			jsonRequest('/api/v1/document/import', payload, requestOptions),
 		ask: (payload, requestOptions) => jsonRequest('/api/ask', payload, requestOptions),
-		retrieve: (payload, requestOptions) => jsonRequest('/api/retrieve', payload, requestOptions)
+		retrieve: (payload, requestOptions) => jsonRequest('/api/retrieve', payload, requestOptions),
+		getEvidence: (chunkId, requestOptions) =>
+			request(`/api/evidence/${encodeURIComponent(chunkId)}`, { signal: requestOptions?.signal })
 	};
 }
 

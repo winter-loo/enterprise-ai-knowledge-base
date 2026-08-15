@@ -288,3 +288,15 @@ def search(question: str, kb_id: str, project_id: str, department: str, top_k: i
         """,
             (query_vector, question, kb_id, project_id, department, top_k),
         ).fetchall()
+
+
+def get_evidence(chunk_id: str) -> DictRow | None:
+    with connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, filename, chunk_index, content, summary, department, project_id,
+                   document_id, source_type, source_uri, page, metadata, created_at
+            FROM knowledge_evidence WHERE id=%s
+            """,
+            (chunk_id,),
+        ).fetchone()

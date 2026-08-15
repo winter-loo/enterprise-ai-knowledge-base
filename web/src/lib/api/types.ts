@@ -135,6 +135,22 @@ export interface RetrieveResponse {
 	retrieved: number;
 }
 
+export interface EvidenceDetail {
+	id: string;
+	filename: string;
+	chunk_index: number;
+	content: string;
+	summary: string;
+	department: string;
+	project_id: string;
+	document_id: string;
+	source_type: string;
+	source_uri: string;
+	page: number | null;
+	metadata: Record<string, unknown>;
+	created_at: string;
+}
+
 export interface ChatCompletionRequest extends ScopePayload {
 	session_id: string;
 	question: string;

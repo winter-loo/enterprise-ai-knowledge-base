@@ -154,6 +154,46 @@ async def test_scope_resolve_rejects_unknown_project(client):
 
 
 @pytest.mark.anyio
+async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
+    monkeypatch.setattr(
+        store,
+        "get_evidence",
+        lambda chunk_id: {
+            "id": chunk_id,
+            "filename": "guide.md",
+            "chunk_index": 0,
+            "content": "完整内容",
+            "summary": "摘要",
+            "department": "engineering",
+            "project_id": "p-1",
+            "document_id": "doc-1",
+            "source_type": "upload",
+            "source_uri": "",
+            "page": 3,
+            "metadata": {"chunking_strategy": "recursive"},
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+    )
+
+    async with client as http:
+        response = await http.get("/api/evidence/chunk-1")
+
+    assert response.status_code == 200
+    assert response.json()["content"] == "完整内容"
+    assert response.json()["page"] == 3
+
+
+@pytest.mark.anyio
+async def test_evidence_returns_404_for_unknown_chunk(client, monkeypatch):
+    monkeypatch.setattr(store, "get_evidence", lambda chunk_id: None)
+
+    async with client as http:
+        response = await http.get("/api/evidence/missing")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.anyio
 async def test_ask_keeps_scope_and_citations(client, monkeypatch):
     async def answer(*_):
         return "请先保存配置。[1]", "test-model"

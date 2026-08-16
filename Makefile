@@ -26,7 +26,7 @@ test: web-install
 	npm --prefix web test
 
 compile:
-	uv run python -m compileall -q rag session tests
+	uv run python -m compileall -q rag session shared tests
 
 build: web-install
 	npm --prefix web run build

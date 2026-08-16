@@ -42,7 +42,7 @@ def test_stale_generation_lease_is_reclaimed_before_active_check(monkeypatch):
     connection = StaleGenerationConnection()
     monkeypatch.setattr(store, "connect", lambda: connection)
 
-    history = store.begin_generation(
+    state = store.begin_generation(
         "session-1",
         "t" * 32,
         "retry after crash",
@@ -52,7 +52,7 @@ def test_stale_generation_lease_is_reclaimed_before_active_check(monkeypatch):
         "engineering",
     )
 
-    assert history == []
+    assert state == {"summary": "", "verbatim": [], "should_compact": False}
     assert connection.committed is True
     cleanup_index = next(index for index, query in enumerate(connection.queries) if query.startswith("DELETE FROM chat_messages"))
     active_index = next(index for index, query in enumerate(connection.queries) if query.startswith("SELECT 1 FROM chat_messages"))

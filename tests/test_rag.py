@@ -6,8 +6,8 @@ from psycopg._queries import _split_query
 
 from rag import store
 from rag.chunking import _token_count
-from rag.main import AskRequest, app, ask_stream, llm_answer, split_text, stream_content
-from rag.openai_responses import response_answer_text
+from rag.main import AskRequest, app, ask_stream, build_prompt, llm_answer, split_text, stream_content
+from shared.openai_responses import response_answer_text
 
 SOURCES = [{"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "score": 0.9, "content": "重启服务前先保存配置。", "summary": "重启前保存配置"}]
 
@@ -61,6 +61,15 @@ def test_split_text_overlaps_chunks():
     chunks = split_text("知识库" * 400)  # 800 token > 默认 size 700, 会切成两片
     assert len(chunks) == 2
     assert all(_token_count(chunk) <= 700 for chunk in chunks)
+
+
+def test_build_prompt_prepends_summary():
+    sources = [{"filename": "guide.md", "content": "重启服务前先保存配置。"}]
+    prompt = build_prompt("如何重启？", sources, "用户之前确认了生产环境。")
+
+    assert prompt.startswith("对话历史摘要：\n用户之前确认了生产环境。\n\n")
+    assert "参考资料：\n[1] guide.md" in prompt
+    assert "问题：如何重启？" in prompt
 
 
 @pytest.mark.anyio

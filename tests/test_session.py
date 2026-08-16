@@ -1,10 +1,12 @@
+import json
 from datetime import UTC, datetime
 
 import httpx
 import pytest
 
-from session import store
+from session import store, summarizer
 from session.main import ChatCompletion, app, chat_stream
+from session.summarizer import update_summary
 
 
 def _complete_generation(messages, session_id, generation_id, content, kb_id, project_id, department):
@@ -35,7 +37,7 @@ def _complete_generation(messages, session_id, generation_id, content, kb_id, pr
 def client(monkeypatch):
     messages = []
 
-    def begin_generation(session_id, session_token, content, generation_id, kb_id="company", project_id="default", department="general", history_limit=12):
+    def begin_generation(session_id, session_token, content, generation_id, kb_id="company", project_id="default", department="general"):
         history = [
             {"role": m["role"], "content": m["content"], "created_at": datetime(2026, 1, 1, tzinfo=UTC)}
             for m in messages
@@ -43,7 +45,7 @@ def client(monkeypatch):
             and m["session_token"] == session_token
             and m.get("generation_complete", False)
             and (m["kb_id"], m["project_id"], m["department"]) == (kb_id, project_id, department)
-        ][-history_limit:]
+        ]
         messages.append(
             {
                 "session_id": session_id,
@@ -57,7 +59,7 @@ def client(monkeypatch):
                 "generation_complete": False,
             }
         )
-        return history
+        return {"summary": "", "verbatim": history, "should_compact": False}
 
     monkeypatch.setattr(store, "begin_generation", begin_generation)
     monkeypatch.setattr(
@@ -137,7 +139,7 @@ async def test_chat_stream_persists_assistant_and_forwards_done(monkeypatch):
     monkeypatch.setattr(store, "rollback_generation", lambda *args: rolled_back.append(args))
     payload = ChatCompletion(session_id="responses-api", session_token="t" * 32, question="继续", kb_id="company", project_id="p-1", department="engineering")
 
-    events = [event async for event in chat_stream(payload, [], "generation-1")]
+    events = [event async for event in chat_stream(payload, "", [], "generation-1")]
 
     assert any('"type": "done"' in event for event in events)
     assert not any('"type": "error"' in event for event in events)
@@ -157,7 +159,7 @@ async def test_chat_stream_rolls_back_on_upstream_error(monkeypatch):
     monkeypatch.setattr(store, "rollback_generation", lambda session_id, generation_id: rolled_back.append((session_id, generation_id)))
     payload = ChatCompletion(session_id="s-1", session_token="t" * 32, question="继续", kb_id="company", project_id="p-1", department="engineering")
 
-    events = [event async for event in chat_stream(payload, [], "generation-1")]
+    events = [event async for event in chat_stream(payload, "", [], "generation-1")]
 
     assert '"message": "upstream failed"' in events[-1]
     assert stored == []
@@ -176,7 +178,7 @@ async def test_chat_stream_does_not_finish_when_session_cleared(monkeypatch):
     monkeypatch.setattr(store, "rollback_generation", lambda session_id, generation_id: rolled_back.append((session_id, generation_id)))
     payload = ChatCompletion(session_id="cleared-session", session_token="t" * 32, question="继续", kb_id="company", project_id="p-1", department="engineering")
 
-    events = [event async for event in chat_stream(payload, [], "generation-1")]
+    events = [event async for event in chat_stream(payload, "", [], "generation-1")]
 
     assert '"type": "error"' in events[-1]
     assert not any('"type": "done"' in event for event in events)
@@ -194,7 +196,7 @@ async def test_chat_stream_rolls_back_when_client_disconnects(monkeypatch):
     rolled_back = []
     monkeypatch.setattr(store, "rollback_generation", lambda session_id, generation_id: rolled_back.append((session_id, generation_id)))
     payload = ChatCompletion(session_id="aborted-session", session_token="t" * 32, question="继续", kb_id="company", project_id="p-1", department="engineering")
-    stream = chat_stream(payload, [], "generation-1")
+    stream = chat_stream(payload, "", [], "generation-1")
 
     _ = await anext(stream)
     _ = await anext(stream)
@@ -236,7 +238,7 @@ async def test_failed_stream_is_excluded_from_history_and_next_prompt(client, mo
         failed = await http.post("/api/v1/chat/completions", json=payload)
         history = await http.get("/api/v1/chat/history/failed-stream", params=scope, headers={"x-session-token": token})
 
-        async def capture_stream(_, prompt_history, __):
+        async def capture_stream(_, __, prompt_history, ___):
             captured_history.extend(prompt_history)
             yield 'data: {"type":"done"}\n\n'
 
@@ -255,10 +257,14 @@ async def test_chat_history_only_passes_model_message_fields(client, monkeypatch
     monkeypatch.setattr(
         store,
         "begin_generation",
-        lambda *_: [{"role": "assistant", "content": "上一轮回答", "created_at": datetime(2026, 1, 1, tzinfo=UTC)}],
+        lambda *_: {
+            "summary": "",
+            "verbatim": [{"role": "assistant", "content": "上一轮回答", "created_at": datetime(2026, 1, 1, tzinfo=UTC)}],
+            "should_compact": False,
+        },
     )
 
-    async def capture_stream(_, prompt_history, __):
+    async def capture_stream(_, __, prompt_history, ___):
         captured_history.extend(prompt_history)
         yield 'data: {"type":"done"}\n\n'
 
@@ -341,3 +347,191 @@ async def test_session_chat_health(client):
 
     assert response.status_code == 200
     assert response.json()["service"] == "enterprise-ai-knowledge-base-session"
+
+
+@pytest.mark.anyio
+async def test_chat_completions_compacts_keeping_recent_window(client, monkeypatch):
+    monkeypatch.setattr(
+        store,
+        "begin_generation",
+        lambda *_: {
+            "summary": "旧摘要",
+            "verbatim": [
+                {"id": 10, "role": "user", "content": "更早问题"},
+                {"id": 11, "role": "assistant", "content": "更早回答"},
+                {"id": 12, "role": "user", "content": "最近问题"},
+            ],
+            "should_compact": True,
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "split_for_compaction",
+        lambda verbatim: (verbatim[:2], verbatim[2:]),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        "session.main.update_summary",
+        lambda prev, msgs: captured.update(prev=prev, msgs=msgs) or "新摘要",
+    )
+    saved = []
+    monkeypatch.setattr(store, "save_summary", lambda *args: saved.append(args))
+    forwarded = {}
+
+    async def capture_ask_stream(**kwargs):
+        forwarded.update(summary=kwargs["summary"], history=kwargs["history"])
+        yield {"type": "done"}
+
+    monkeypatch.setattr("session.main.ask_stream", capture_ask_stream)
+
+    async with client as http:
+        response = await http.post("/api/v1/chat/completions", json=_payload(session_id="long-conv"))
+
+    assert response.status_code == 200
+    assert captured["prev"] == "旧摘要"
+    assert [message["content"] for message in captured["msgs"]] == ["更早问题", "更早回答"]
+    assert saved[0][5] == "新摘要"
+    assert saved[0][6] == 12
+    assert forwarded["summary"] == "新摘要"
+    assert [message["content"] for message in forwarded["history"]] == ["最近问题"]
+
+
+def test_split_for_compaction_keeps_recent_and_snaps_to_turn(monkeypatch):
+    monkeypatch.setattr("session.store.count_tokens", lambda text: 1)
+    monkeypatch.setattr("session.store.KEEP_RECENT_TOKENS", 2)
+    verbatim = [
+        {"id": 1, "role": "user", "content": "u1"},
+        {"id": 2, "role": "assistant", "content": "a1"},
+        {"id": 3, "role": "user", "content": "u2"},
+        {"id": 4, "role": "assistant", "content": "a2"},
+        {"id": 5, "role": "user", "content": "u3"},
+    ]
+
+    to_summarize, kept = store.split_for_compaction(verbatim)
+
+    assert [message["id"] for message in to_summarize] == [1, 2]
+    assert [message["id"] for message in kept] == [3, 4, 5]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_passes_verbatim_without_compression(client, monkeypatch):
+    monkeypatch.setattr(
+        store,
+        "begin_generation",
+        lambda *_: {
+            "summary": "旧摘要",
+            "verbatim": [{"id": 10, "role": "user", "content": "最近问题"}],
+            "should_compact": False,
+        },
+    )
+    forwarded = {}
+
+    async def capture_ask_stream(**kwargs):
+        forwarded.update(summary=kwargs["summary"], history=kwargs["history"])
+        yield {"type": "done"}
+
+    monkeypatch.setattr("session.main.ask_stream", capture_ask_stream)
+    compressed = []
+    monkeypatch.setattr("session.main.update_summary", lambda *args: compressed.append(args))
+
+    async with client as http:
+        response = await http.post("/api/v1/chat/completions", json=_payload(session_id="short-conv"))
+
+    assert response.status_code == 200
+    assert forwarded["summary"] == "旧摘要"
+    assert [message["content"] for message in forwarded["history"]] == ["最近问题"]
+    assert compressed == []
+
+
+@pytest.mark.anyio
+async def test_chat_completions_keeps_verbatim_when_summary_fails(client, monkeypatch):
+    monkeypatch.setattr(
+        store,
+        "begin_generation",
+        lambda *_: {
+            "summary": "旧摘要",
+            "verbatim": [
+                {"id": 10, "role": "user", "content": "更早问题"},
+                {"id": 11, "role": "assistant", "content": "更早回答"},
+            ],
+            "should_compact": True,
+        },
+    )
+    monkeypatch.setattr("session.main.update_summary", lambda prev, msgs: None)
+    saved = []
+    monkeypatch.setattr(store, "save_summary", lambda *args: saved.append(args))
+    forwarded = {}
+
+    async def capture_ask_stream(**kwargs):
+        forwarded.update(summary=kwargs["summary"], history=kwargs["history"])
+        yield {"type": "done"}
+
+    monkeypatch.setattr("session.main.ask_stream", capture_ask_stream)
+
+    async with client as http:
+        response = await http.post("/api/v1/chat/completions", json=_payload(session_id="fallback-conv"))
+
+    assert response.status_code == 200
+    assert saved == []
+    assert forwarded["summary"] == "旧摘要"
+    assert [message["content"] for message in forwarded["history"]] == ["更早问题", "更早回答"]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_rolls_back_when_compaction_fails(client, monkeypatch):
+    monkeypatch.setattr(
+        store,
+        "begin_generation",
+        lambda *_: {
+            "summary": "旧摘要",
+            "verbatim": [{"id": 10, "role": "user", "content": "更早问题"}],
+            "should_compact": True,
+        },
+    )
+    monkeypatch.setattr(
+        "session.main.update_summary",
+        lambda prev, msgs: (_ for _ in ()).throw(RuntimeError("summarization unavailable")),
+    )
+    rolled_back = []
+    monkeypatch.setattr(
+        store,
+        "rollback_generation",
+        lambda session_id, generation_id: rolled_back.append((session_id, generation_id)),
+    )
+
+    async with client as http:
+        with pytest.raises(RuntimeError, match="summarization unavailable"):
+            await http.post("/api/v1/chat/completions", json=_payload(session_id="fail-conv"))
+
+    assert len(rolled_back) == 1
+    assert rolled_back[0][0] == "fail-conv"
+
+
+def test_update_summary_returns_none_when_no_llm(monkeypatch):
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+    assert update_summary("旧摘要", [{"role": "user", "content": "新问题"}]) is None
+
+
+def test_update_summary_uses_configured_llm(monkeypatch):
+    real_client = httpx.Client
+
+    def handler(request):
+        assert request.url == "http://llm.test/v1/responses"
+        body = json.loads(request.read())
+        assert "现有摘要" in body["input"][-1]["content"]
+        return httpx.Response(
+            200,
+            json={
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "更新后的摘要"}]}],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_API_KEY", "secret")
+    monkeypatch.setattr(summarizer.httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs))
+
+    assert update_summary("旧摘要", [{"role": "user", "content": "新问题"}]) == "更新后的摘要"

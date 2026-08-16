@@ -43,6 +43,7 @@ async def ask_stream(
     project_id: str,
     department: str,
     top_k: int,
+    summary: str = "",
 ) -> AsyncIterator[JsonObject]:
     """Stream the stateless RAG ask endpoint and yield parsed SSE events."""
     payload = {
@@ -52,6 +53,7 @@ async def ask_stream(
         "project_id": project_id,
         "department": department,
         "top_k": top_k,
+        "summary": summary,
         "stream": True,
     }
     async with httpx.AsyncClient(timeout=120) as client, client.stream("POST", f"{base_url()}/api/ask", json=payload) as response:

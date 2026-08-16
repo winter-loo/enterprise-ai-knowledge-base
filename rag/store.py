@@ -12,7 +12,7 @@ import psycopg
 from psycopg.rows import DictRow, dict_row
 from psycopg.sql import SQL
 
-from rag.openai_responses import build_response_input, build_response_request, response_answer_text
+from shared.openai_responses import build_response_input, build_response_request, response_answer_text
 
 EMBEDDING_DIMENSIONS = 1024
 # Qwen3 Embedding 属于支持 instruction-aware retrieval 的向量模型。相同的一段文字, 在不同任务下可能应该产生不同的向量表示。

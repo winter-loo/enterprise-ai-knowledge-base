@@ -4,12 +4,26 @@ import hashlib
 import hmac
 import os
 from datetime import UTC, datetime
-from typing import cast
+from typing import TypedDict, cast
 
 import psycopg
 from psycopg.rows import DictRow, dict_row
 
+from shared.tokens import count_tokens
+
 GENERATION_LEASE_SECONDS = 900
+# 与 Pi 的 compaction 对齐: 上下文超过 (模型窗口 - 预留) 时触发一次压缩, 压缩时保留最近
+# KEEP_RECENT_TOKENS 的原文窗口, 更早的部分并入摘要。
+MODEL_CONTEXT_TOKENS = int(os.getenv("RAG_CONTEXT_TOKENS", "128000"))
+RESERVE_TOKENS = int(os.getenv("RAG_RESERVE_TOKENS", "16384"))
+KEEP_RECENT_TOKENS = int(os.getenv("RAG_KEEP_RECENT_TOKENS", "20000"))
+CONTEXT_BUDGET = MODEL_CONTEXT_TOKENS - RESERVE_TOKENS
+
+
+class GenerationState(TypedDict):
+    summary: str
+    verbatim: list[DictRow]
+    should_compact: bool
 
 
 def connect() -> psycopg.Connection[DictRow]:
@@ -38,6 +52,13 @@ def init_db() -> None:
                 department TEXT NOT NULL, session_token_hash TEXT NOT NULL DEFAULT '', cleared_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(session_id,kb_id,project_id,department,session_token_hash)
             );
+            CREATE TABLE IF NOT EXISTS chat_session_summaries (
+                session_id TEXT NOT NULL, kb_id TEXT NOT NULL, project_id TEXT NOT NULL,
+                department TEXT NOT NULL, session_token_hash TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '', first_kept_id BIGINT,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(session_id,kb_id,project_id,department,session_token_hash)
+            );
             CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_messages(session_id, id);
         """)
         _ = conn.execute(
@@ -63,15 +84,13 @@ def begin_generation(
     kb_id: str = "company",
     project_id: str = "default",
     department: str = "general",
-    history_limit: int = 12,
-) -> list[DictRow] | None:
-    """Reserve one chat turn and return only history from completed turns.
+) -> GenerationState | None:
+    """Reserve one chat turn and return the context needed to answer it.
 
-    The reservation is deliberately committed before retrieval/LLM work: those
-    operations can take a long time and must not hold a database transaction.
-    The pending user row, generation_id, session token, and advisory lock give
-    later completion/rollback code an atomic way to decide whether the stream
-    may still write an assistant message.
+    The state carries the recent verbatim turns, the rolling summary of older
+    turns, and any older turns not yet folded into that summary. The reservation
+    is committed before retrieval/LLM work: those operations can take a long
+    time and must not hold a database transaction.
     """
     with connect() as conn:
         _ = conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (session_id,))
@@ -112,17 +131,31 @@ def begin_generation(
         ).fetchone()
         if active_generation is not None:
             return None
-        history = conn.execute(
+        summary_row = conn.execute(
             """
-            SELECT role,content,created_at FROM (
-                SELECT * FROM chat_messages
-                WHERE session_id=%s AND kb_id=%s AND project_id=%s AND department=%s
-                  AND session_token_hash=%s AND generation_complete=TRUE
-                ORDER BY id DESC LIMIT %s
-            ) m ORDER BY id
+            SELECT summary, first_kept_id FROM chat_session_summaries
+            WHERE session_id=%s AND kb_id=%s AND project_id=%s AND department=%s
+              AND session_token_hash=%s
             """,
-            (session_id, kb_id, project_id, department, token_hash, history_limit),
+            (session_id, kb_id, project_id, department, token_hash),
+        ).fetchone()
+        if summary_row is None:
+            summary = ""
+            first_kept_id = None
+        else:
+            summary = cast(str, summary_row["summary"])
+            first_kept_id = cast(int | None, summary_row["first_kept_id"])
+        verbatim = conn.execute(
+            """
+            SELECT id, role, content, created_at FROM chat_messages
+            WHERE session_id=%s AND kb_id=%s AND project_id=%s AND department=%s
+              AND session_token_hash=%s AND generation_complete=TRUE AND id >= %s
+            ORDER BY id
+            """,
+            (session_id, kb_id, project_id, department, token_hash, first_kept_id or 1),
         ).fetchall()
+        history_tokens = count_tokens(summary) + sum(count_tokens(cast(str, message["content"])) for message in verbatim)
+        should_compact = history_tokens > CONTEXT_BUDGET
         _ = conn.execute(
             """
             INSERT INTO chat_messages
@@ -132,7 +165,68 @@ def begin_generation(
             (session_id, content, now(), kb_id, project_id, department, generation_id, token_hash),
         )
         conn.commit()
-        return history
+        return {"summary": summary, "verbatim": verbatim, "should_compact": should_compact}
+
+
+def split_for_compaction(verbatim: list[DictRow]) -> tuple[list[DictRow], list[DictRow]]:
+    """Split verbatim into (to_summarize, kept) by the recent token window.
+
+    Kept is the newest messages whose tokens fit in KEEP_RECENT_TOKENS, snapped
+    to a turn (user) boundary so a user/assistant pair is never split.
+    """
+    cut = len(verbatim)
+    kept_tokens = 0
+    for index in range(len(verbatim) - 1, -1, -1):
+        message_tokens = count_tokens(cast(str, verbatim[index]["content"]))
+        if cut < len(verbatim) and kept_tokens + message_tokens > KEEP_RECENT_TOKENS:
+            break
+        cut = index
+        kept_tokens += message_tokens
+    while cut > 0 and verbatim[cut]["role"] == "assistant":
+        cut -= 1
+    return verbatim[:cut], verbatim[cut:]
+
+
+def save_summary(
+    session_id: str,
+    kb_id: str,
+    project_id: str,
+    department: str,
+    session_token: str,
+    summary: str,
+    first_kept_id: int | None,
+) -> bool:
+    """Persist a compacted summary; refuse when the session was cleared meanwhile.
+
+    Takes the same advisory lock as clear_session and checks for a tombstone, so
+    a summary whose LLM call was in flight during a clear cannot resurrect the
+    deleted conversation.
+    """
+    with connect() as conn:
+        _ = conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (session_id,))
+        token_hash = session_token_hash(session_token)
+        tombstone = conn.execute(
+            """
+            SELECT 1 FROM chat_session_tombstones
+            WHERE session_id=%s AND kb_id=%s AND project_id=%s AND department=%s
+              AND session_token_hash=%s
+            """,
+            (session_id, kb_id, project_id, department, token_hash),
+        ).fetchone()
+        if tombstone is not None:
+            conn.commit()
+            return False
+        _ = conn.execute(
+            """
+            INSERT INTO chat_session_summaries(session_id,kb_id,project_id,department,session_token_hash,summary,first_kept_id,updated_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(session_id,kb_id,project_id,department,session_token_hash)
+            DO UPDATE SET summary=EXCLUDED.summary, first_kept_id=EXCLUDED.first_kept_id, updated_at=EXCLUDED.updated_at
+            """,
+            (session_id, kb_id, project_id, department, token_hash, summary, first_kept_id, now()),
+        )
+        conn.commit()
+        return True
 
 
 def list_messages(
@@ -187,8 +281,13 @@ def clear_session(
                 "DELETE FROM chat_messages WHERE session_id=%s AND kb_id=%s AND project_id=%s AND department=%s AND session_token_hash=%s",
                 (session_id, kb_id, project_id, department, token_hash),
             ).rowcount
+            _ = conn.execute(
+                "DELETE FROM chat_session_summaries WHERE session_id=%s AND kb_id=%s AND project_id=%s AND department=%s AND session_token_hash=%s",
+                (session_id, kb_id, project_id, department, token_hash),
+            )
         else:
             deleted = conn.execute("DELETE FROM chat_messages WHERE session_id=%s", (session_id,)).rowcount
+            _ = conn.execute("DELETE FROM chat_session_summaries WHERE session_id=%s", (session_id,))
         if kb_id is not None and project_id is not None and department is not None and token_hash is not None:
             _ = conn.execute(
                 """

@@ -20,14 +20,14 @@ from starlette.concurrency import run_in_threadpool
 
 from rag import store
 from rag.chunking import chunk_text
-from rag.openai_responses import (
+from shared.openai_responses import (
     build_response_input,
     build_response_request,
     response_answer_text,
     stream_completed,
     stream_error,
 )
-from rag.openai_responses import (
+from shared.openai_responses import (
     stream_delta as stream_content,
 )
 
@@ -100,6 +100,7 @@ class AskRequest(BaseModel):
     department: str = "general"
     top_k: int = Field(default=5, ge=1, le=10)
     history: list[dict[str, str]] = Field(default_factory=list)
+    summary: str = ""
     stream: bool = False
 
 
@@ -216,14 +217,19 @@ def resolve_and_search(question: str, kb_id: str, project_id: str, department: s
     return store.search(question, kb_id, resolved_project_id, department, top_k)
 
 
-async def llm_answer(question: str, sources: list[DictRow], history: list[dict[str, str]]) -> tuple[str, str]:
+def build_prompt(question: str, sources: list[DictRow], summary: str = "") -> str:
+    context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
+    prefix = f"对话历史摘要：\n{summary}\n\n" if summary else ""
+    return f"{prefix}参考资料：\n{context or '无'}\n\n问题：{question}"
+
+
+async def llm_answer(question: str, sources: list[DictRow], history: list[dict[str, str]], summary: str = "") -> tuple[str, str]:
     base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
     api_key = os.getenv("LLM_API_KEY", "")
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
     if not base_url or not api_key:
         return fallback_answer(sources), "local-fallback"
-    context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-    prompt = f"参考资料：\n{context or '无'}\n\n问题：{question}"
+    prompt = build_prompt(question, sources, summary)
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(
@@ -250,8 +256,7 @@ async def ask_stream(payload: AskRequest, sources: list[DictRow]) -> AsyncIterat
         yield f"data: {json.dumps({'type': 'sources', 'sources': cited_sources(answer, sources)}, ensure_ascii=False)}\n\n"
         yield 'data: {"type":"done"}\n\n'
         return
-    context = "\n\n".join(f"[{i + 1}] {source['filename']}\n{source['content']}" for i, source in enumerate(sources))
-    prompt = f"参考资料：\n{context or '无'}\n\n问题：{payload.question}"
+    prompt = build_prompt(payload.question, sources, payload.summary)
     answer = ""
     completed = False
     try:
@@ -264,7 +269,9 @@ async def ask_stream(payload: AskRequest, sources: list[DictRow]) -> AsyncIterat
                 json=build_response_request(
                     model,
                     KNOWLEDGE_ASSISTANT_INSTRUCTIONS,
-                    build_response_input(payload.history, prompt, 12),
+                    # The session service already sizes history to its token budget,
+                    # so pass it through without re-truncating to a fixed count.
+                    build_response_input(payload.history, prompt, len(payload.history) or 1),
                     stream=True,
                 ),
             ) as response,
@@ -429,7 +436,7 @@ async def ask(payload: AskRequest) -> JsonObject | StreamingResponse:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
-    answer, answer_mode = await llm_answer(payload.question, sources, payload.history)
+    answer, answer_mode = await llm_answer(payload.question, sources, payload.history, payload.summary)
     citations = cited_sources(answer, sources)
     return {"answer": answer, "answer_mode": answer_mode, "citations": citations, "retrieved": len(sources)}
 

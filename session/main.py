@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from session import store
 from session.rag_client import ask_stream, resolve_scope
+from session.summarizer import update_summary
 
 JsonObject = dict[str, object]
 
@@ -53,7 +54,7 @@ def canonical_project_id(kb_id: str, project_id: str, department: str) -> str:
     return cast(str, scope["project_id"])
 
 
-async def chat_stream(payload: ChatCompletion, history: list[dict[str, str]], generation_id: str) -> AsyncIterator[str]:
+async def chat_stream(payload: ChatCompletion, summary: str, history: list[dict[str, str]], generation_id: str) -> AsyncIterator[str]:
     # A generation is one persisted user turn plus its eventual assistant turn.
     # Retrieval and grounded generation are delegated to the RAG service; the
     # generation_id lets this completion step verify that the turn still exists
@@ -68,6 +69,7 @@ async def chat_stream(payload: ChatCompletion, history: list[dict[str, str]], ge
             project_id=payload.project_id,
             department=payload.department,
             top_k=payload.top_k,
+            summary=summary,
         ):
             event_type = event.get("type")
             if event_type == "delta":
@@ -109,7 +111,7 @@ def chat_completions(payload: ChatCompletion) -> StreamingResponse:
     # the same canonical project id that retrieval uses ("default" is an alias).
     resolved_project_id = canonical_project_id(payload.kb_id, payload.project_id, payload.department)
     generation_id = uuid.uuid4().hex
-    history_rows = store.begin_generation(
+    state = store.begin_generation(
         payload.session_id,
         payload.session_token,
         payload.question,
@@ -118,12 +120,42 @@ def chat_completions(payload: ChatCompletion) -> StreamingResponse:
         resolved_project_id,
         payload.department,
     )
-    if history_rows is None:
+    if state is None:
         raise HTTPException(409, "会话已清除、凭证不匹配或已有生成请求正在进行")
-    history = [{"role": row_string(message, "role"), "content": row_string(message, "content")} for message in history_rows]
+    try:
+        summary = state["summary"]
+        verbatim = state["verbatim"]
+        if state["should_compact"]:
+            # 上下文接近模型上限: 保留最近 KEEP_RECENT_TOKENS 的原文窗口, 把窗口之前的部分并入摘要。
+            to_summarize, kept = store.split_for_compaction(verbatim)
+            new_summary = update_summary(
+                summary,
+                [{"role": row_string(message, "role"), "content": row_string(message, "content")} for message in to_summarize],
+            )
+            if new_summary is None:
+                # 摘要失败/无 LLM: 不推进 first_kept_id, 保留全部原文, 下一轮重试。
+                history = [{"role": row_string(message, "role"), "content": row_string(message, "content")} for message in verbatim]
+            else:
+                summary = new_summary
+                store.save_summary(
+                    payload.session_id,
+                    payload.kb_id,
+                    resolved_project_id,
+                    payload.department,
+                    payload.session_token,
+                    summary,
+                    cast(int, kept[0]["id"]) if kept else None,
+                )
+                history = [{"role": row_string(message, "role"), "content": row_string(message, "content")} for message in kept]
+        else:
+            history = [{"role": row_string(message, "role"), "content": row_string(message, "content")} for message in verbatim]
+    except Exception:
+        # 预流式压缩失败时回滚已提交的 user 行, 避免后续重试一直 409。
+        store.rollback_generation(payload.session_id, generation_id)
+        raise
     resolved_payload = payload.model_copy(update={"project_id": resolved_project_id})
     return StreamingResponse(
-        chat_stream(resolved_payload, history, generation_id),
+        chat_stream(resolved_payload, summary, history, generation_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )

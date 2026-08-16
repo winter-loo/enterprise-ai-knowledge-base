@@ -62,6 +62,8 @@ def import_one(
     chunking_strategy: str,
 ) -> tuple[str, str]:
     """解析并写入单个文件, 返回 (状态, 说明); 状态为 imported、skipped 或 failed。"""
+    if path.suffix.lower() not in rag_main.SUPPORTED_SUFFIXES:
+        return "skipped", "不支持的文档格式"
     try:
         data = path.read_bytes()
         text, parser, pdf_type, pages_needing_ocr = rag_main.parse_document(path.name, data)
@@ -82,7 +84,8 @@ def import_one(
             chunking_strategy=chunking_strategy,
         )
     except HTTPException as exc:
-        return "skipped", str(exc.detail)
+        # 后缀受支持但解析失败(损坏的 PDF/Office 文档), 计为失败而非跳过。
+        return "failed", str(exc.detail)
     except Exception as exc:
         return "failed", f"{type(exc).__name__}: {exc}"
     return "imported", f"{len(chunks)} 个片段"

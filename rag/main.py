@@ -39,6 +39,31 @@ UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 KNOWLEDGE_ASSISTANT_INSTRUCTIONS = "你是企业知识库助手。只能根据参考资料回答；资料不足时明确说不知道。必须保留引用编号，如[1]。不要编造政策、数字或来源。"
 
+# 支持入库的文档后缀, 供上传接口与命令行批量导入复用。anydoc 与纯文本分别
+# 对应 extract_text 的两条解析路径, pdf 由 parse_document 用 pdf-inspector 处理。
+ANYDOC_SUFFIXES = frozenset(
+    {
+        ".doc",
+        ".docx",
+        ".docm",
+        ".ppt",
+        ".pptx",
+        ".pptm",
+        ".xls",
+        ".xlsx",
+        ".xlsm",
+        ".xlsb",
+        ".odt",
+        ".ods",
+        ".odp",
+        ".rtf",
+        ".epub",
+        ".csv",
+    }
+)
+PLAIN_TEXT_SUFFIXES = frozenset({".txt", ".md", ".json", ".log", ".html", ".xml"})
+SUPPORTED_SUFFIXES = ANYDOC_SUFFIXES | PLAIN_TEXT_SUFFIXES | frozenset({".pdf"})
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -115,13 +140,13 @@ def resolve_project_id(kb_id: str, project_id: str) -> str:
 
 def extract_text(filename: str, data: bytes) -> str:
     suffix = Path(filename).suffix.lower()
-    if suffix in {".doc", ".docx", ".docm", ".ppt", ".pptx", ".pptm", ".xls", ".xlsx", ".xlsm", ".xlsb", ".odt", ".ods", ".odp", ".rtf", ".epub", ".csv"}:
+    if suffix in ANYDOC_SUFFIXES:
         try:
             document_format = cast(anydoc.Format, suffix.removeprefix("."))
             return anydoc.to_markdown_bytes(data, document_format)
         except Exception as exc:
             raise HTTPException(415, f"文档解析失败：{exc}") from exc
-    if suffix in {".txt", ".md", ".json", ".log", ".html", ".xml"}:
+    if suffix in PLAIN_TEXT_SUFFIXES:
         return data.decode("utf-8", errors="replace")
     raise HTTPException(415, "不支持的文档格式")
 
@@ -134,7 +159,7 @@ def parse_document(filename: str, data: bytes) -> tuple[str, str, str | None, li
         except Exception as exc:
             raise HTTPException(415, f"文档解析失败：{exc}") from exc
     text = extract_text(filename, data)
-    parser = "anydoc" if Path(filename).suffix.lower() not in {".txt", ".md", ".json", ".log", ".html", ".xml"} else "plain-text"
+    parser = "anydoc" if Path(filename).suffix.lower() not in PLAIN_TEXT_SUFFIXES else "plain-text"
     return text, parser, None, []
 
 

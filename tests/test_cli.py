@@ -63,10 +63,21 @@ def test_main_skips_unsupported_files(tmp_path, monkeypatch, capsys):
     (tmp_path / "a.png").write_bytes(b"not a document")
 
     _mock_scope(monkeypatch)
-    monkeypatch.setattr("rag.main.parse_document", lambda *_: (_ for _ in ()).throw(HTTPException(415, "不支持的文档格式")))
 
     assert main([str(tmp_path)]) == 0
     assert "完成：导入 0 个，跳过 1 个，失败 0 个" in capsys.readouterr().out
+
+
+def test_main_counts_parse_failure_as_failed(tmp_path, monkeypatch, capsys):
+    (tmp_path / "broken.pdf").write_bytes(b"%PDF-corrupt")
+
+    _mock_scope(monkeypatch)
+    monkeypatch.setattr("rag.main.parse_document", lambda *_: (_ for _ in ()).throw(HTTPException(415, "文档解析失败：corrupt")))
+
+    assert main([str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "完成：导入 0 个，跳过 0 个，失败 1 个" in out
+    assert "[failed] broken.pdf" in out
 
 
 def test_main_continues_after_file_failure(tmp_path, monkeypatch, capsys):

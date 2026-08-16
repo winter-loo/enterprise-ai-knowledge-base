@@ -37,7 +37,7 @@
 	}
 
 	$effect(() => {
-		const scopeKey = `${scope.kbId}\u0000${scope.projectId}\u0000${scope.department}`;
+		const scopeKey = `${scope.kbId}\u0000${scope.projectId}\u0000${scope.accessScope}`;
 		if (!open || (previousScopeKey && previousScopeKey !== scopeKey)) cancelSearch();
 		previousScopeKey = scopeKey;
 	});
@@ -58,7 +58,7 @@
 					question: question.trim(),
 					kb_id: scope.kbId,
 					project_id: scope.projectId,
-					department: scope.department,
+					access_scope: scope.accessScope,
 					top_k: topK,
 					history
 				},

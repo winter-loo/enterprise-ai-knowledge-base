@@ -41,8 +41,24 @@ _Avoid_: Source Coverage, lossless reconstruction, completeness
 ### Retrieval & Conversation
 
 **Scope**:
-The triple (kb_id, project_id, department) that bounds which knowledge evidence a query may retrieve. Project controls the relevance boundary; department controls the access boundary; the two are not interchangeable.
+The triple (kb_id, project_id, access_scope) that bounds which knowledge evidence a query may retrieve. Project controls the relevance boundary; access_scope is an opaque column RAG stores but does not interpret — the access boundary is decided by authz Grants and enforced by its RLS policy, never by a caller-supplied string.
 _Avoid_: 权限范围, context, boundary
+
+**Principal**:
+The identity of a caller (user or agent), carried by the trusted `x-principal` header and resolved by the authz service. Future SSO subjects plug into the same seam.
+_Avoid_: user id (ambiguous), caller
+
+**Grant**:
+The unit of authorization binding a Principal to a Role over a Project, optionally narrowed to a Department (or its subtree). Visible Scope is derived from Grants; a Grant is never supplied by the caller.
+_Avoid_: permission (too narrow), ACL
+
+**Visible Scope**:
+The effective access a Principal holds within a Project: the set of Departments (public department plus granted subtrees), or the whole Project for a project-wide Grant. authz computes it and hands it to callers as an opaque scope_context; RAG passes it through to Postgres, whose authz-owned RLS policy enforces it at row level. RAG never interprets it.
+_Avoid_: 权限范围, scope filter, predicate
+
+**Scope Context**:
+The opaque string form of a Visible Scope passed into RAG (the `x-scope-context` header, set as the `app.visible_scope` session setting): `*` for a project-wide Grant, otherwise a comma-joined list of visible department ids. RAG treats it as a black box.
+_Avoid_: scope, predicate, filter
 
 **Retrieve**:
 A stateless primitive that turns a query into ranked Chunks from the knowledge base. It performs no generation and persists nothing.

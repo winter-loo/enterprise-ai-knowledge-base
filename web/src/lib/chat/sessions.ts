@@ -34,8 +34,8 @@ function isSession(value: unknown): value is LocalChatSession {
 		session.scope.kbId.length > 0 &&
 		typeof session.scope.projectId === 'string' &&
 		session.scope.projectId.length > 0 &&
-		typeof session.scope.department === 'string' &&
-		session.scope.department.length > 0
+		typeof session.scope.accessScope === 'string' &&
+		session.scope.accessScope.length > 0
 	);
 }
 

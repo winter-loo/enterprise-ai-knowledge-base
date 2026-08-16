@@ -27,7 +27,8 @@ def _fastapi_detail(response: httpx.Response) -> str | None:
 
 def resolve_scope(kb_id: str, project_id: str, department: str) -> JsonObject:
     """Canonicalize a scope through the RAG service; raises RuntimeError on a bad scope."""
-    payload = {"kb_id": kb_id, "project_id": project_id, "department": department}
+    del department  # Session keeps this compatibility parameter as its opaque scope key.
+    payload = {"kb_id": kb_id, "project_id": project_id}
     with httpx.Client(timeout=10) as client:
         response = client.post(f"{base_url()}/api/scope/resolve", json=payload)
     if response.is_error:
@@ -51,12 +52,12 @@ async def ask_stream(
         "history": history,
         "kb_id": kb_id,
         "project_id": project_id,
-        "department": department,
         "top_k": top_k,
         "summary": summary,
         "stream": True,
     }
-    async with httpx.AsyncClient(timeout=120) as client, client.stream("POST", f"{base_url()}/api/ask", json=payload) as response:
+    headers = {"x-scope-context": department}
+    async with httpx.AsyncClient(timeout=120) as client, client.stream("POST", f"{base_url()}/api/ask", json=payload, headers=headers) as response:
         _ = response.raise_for_status()
         async for line in response.aiter_lines():
             if not line.startswith("data:"):

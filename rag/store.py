@@ -15,6 +15,11 @@ from psycopg.sql import SQL
 from shared.openai_responses import build_response_input, build_response_request, response_answer_text
 
 EMBEDDING_DIMENSIONS = 1024
+# 行级可见性的会话设置名,与 authz 服务的 RLS 策略约定一致:RAG 把调用方传来的
+# 不透明 scope_context 写入该设置,由 Postgres RLS 行级过滤 knowledge_evidence。
+# RAG 不解释 scope_context 的含义('*' 表示全项目可见)。
+SCOPE_SETTING = "app.visible_scope"
+SCOPE_ALL = "*"
 # Qwen3 Embedding 属于支持 instruction-aware retrieval 的向量模型。相同的一段文字, 在不同任务下可能应该产生不同的向量表示。
 # 这条指令告诉模型:
 # - 输入是用户查询, 不是普通文档
@@ -35,11 +40,15 @@ class EmbeddingResponse(TypedDict):
     data: list[EmbeddingData]
 
 
-def connect() -> psycopg.Connection[DictRow]:
+def connect(scope_context: str = SCOPE_ALL) -> psycopg.Connection[DictRow]:
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
-    return psycopg.Connection[DictRow].connect(database_url, row_factory=dict_row)
+    conn = psycopg.Connection[DictRow].connect(database_url, row_factory=dict_row)
+    # 把 authz 计算好的不透明可见范围应用到当前事务;Postgres RLS 策略据此在
+    # 行级过滤 knowledge_evidence。RAG 只做透传,不知道 scope_context 的含义。
+    conn.execute(f"SELECT set_config('{SCOPE_SETTING}', %s, true)", (scope_context,))
+    return conn
 
 
 def now() -> str:
@@ -60,11 +69,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS knowledge_evidence (
                 id TEXT PRIMARY KEY, kb_id TEXT NOT NULL REFERENCES knowledge_bases(id), project_id TEXT NOT NULL REFERENCES projects(id),
                 document_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',
-                embedding vector(1024) NOT NULL, department TEXT NOT NULL DEFAULT 'general', status TEXT NOT NULL DEFAULT 'READY',
+                embedding vector(1024) NOT NULL, access_scope TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'READY',
                 source_type TEXT NOT NULL DEFAULT 'upload', source_uri TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
                 page INTEGER, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_evidence_scope ON knowledge_evidence(kb_id, project_id, department, status);
+            CREATE INDEX IF NOT EXISTS idx_evidence_scope ON knowledge_evidence(kb_id, project_id, access_scope, status);
             CREATE INDEX IF NOT EXISTS idx_evidence_fts ON knowledge_evidence USING GIN (to_tsvector('simple', content));
         """)
         dimension_row = conn.execute("""
@@ -186,7 +195,7 @@ def insert_document(
     project_id: str,
     document_id: str,
     filename: str,
-    department: str,
+    access_scope: str,
     parser: str,
     pdf_type: str | None,
     pages_needing_ocr: list[int],
@@ -202,7 +211,7 @@ def insert_document(
             _ = conn.execute(
                 """
                 INSERT INTO knowledge_evidence
-                (id,kb_id,project_id,document_id,chunk_index,content,summary,embedding,department,status,source_type,source_uri,filename,page,metadata,created_at)
+                (id,kb_id,project_id,document_id,chunk_index,content,summary,embedding,access_scope,status,source_type,source_uri,filename,page,metadata,created_at)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,'READY','upload',%s,%s,NULL,%s::jsonb,%s)
             """,
                 (
@@ -214,7 +223,7 @@ def insert_document(
                     content,
                     summary,
                     vector_literal(vector),
-                    department,
+                    access_scope,
                     stored_path,
                     filename,
                     json.dumps({"parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr, "chunking_strategy": chunking_strategy}),
@@ -240,7 +249,7 @@ def list_documents(kb_id: str) -> list[DictRow]:
         return conn.execute(
             """
             SELECT document_id AS id, max(filename) AS filename, max(project_id) AS project_id,
-                   max(department) AS department, max(status) AS status, count(*) AS chunk_count,
+                   max(access_scope) AS access_scope, max(status) AS status, count(*) AS chunk_count,
                    max(source_type) AS source_type, max(metadata->>'parser') AS parser,
                    max(metadata->>'pdf_type') AS pdf_type, max(metadata->>'chunking_strategy') AS chunking_strategy,
                    max(created_at) AS created_at
@@ -250,54 +259,54 @@ def list_documents(kb_id: str) -> list[DictRow]:
         ).fetchall()
 
 
-def search(question: str, kb_id: str, project_id: str, department: str, top_k: int) -> list[DictRow]:
+def search(question: str, kb_id: str, project_id: str, scope_context: str, top_k: int) -> list[DictRow]:
     instructed = f"Instruct: {QUERY_INSTRUCTION}\nQuery: {question}"
     query_vector = vector_literal(embed([instructed])[0])
-    with connect() as conn:
+    with connect(scope_context) as conn:
         return conn.execute(
             """
-            -- 候选集只包含当前知识库和 Project 中，当前部门可见（本部门或 general）
-            -- 且已完成索引的片段。权限过滤发生在评分前，避免越权片段进入召回结果。
+            -- 候选集只包含当前知识库和 Project 中已完成索引的片段。行级可见性
+            -- 由 authz 拥有的 Postgres RLS 策略强制,本 SQL 不含任何权限谓词:
+            -- connect() 已把不透明 scope_context 写入会话设置,数据库在行级过滤。
             WITH candidates AS (
                 SELECT e.*,
-                       -- pgvector 的 <=> 返回余弦距离：cosine_distance = 1 - cosine_similarity。
-                       -- 因此 1 - distance 还原为 cosine similarity。越接近 1，向量语义越相似；
-                       -- 0 表示正交，负数表示方向相反。query_vector 是问题经 Qwen 检索指令编码后的向量。
+                       -- pgvector 的 <=> 返回余弦距离:cosine_distance = 1 - cosine_similarity。
+                       -- 因此 1 - distance 还原为 cosine similarity。越接近 1,向量语义越相似;
+                       -- 0 表示正交,负数表示方向相反。query_vector 是问题经 Qwen 检索指令编码后的向量。
                        1 - (e.embedding <=> %s::vector) AS semantic_score,
-                       -- 将片段和问题转换为 PostgreSQL simple 配置的 tsvector/tsquery，
-                       -- ts_rank 根据命中词及其位置计算词法相关性；命中越充分，分数通常越高。
+                       -- 将片段和问题转换为 PostgreSQL simple 配置的 tsvector/tsquery,
+                       -- ts_rank 根据命中词及其位置计算词法相关性;命中越充分,分数通常越高。
                        ts_rank(to_tsvector('simple', e.content), websearch_to_tsquery('simple', %s)) AS lexical_score,
-                       -- 片段创建至今的天数，供下面的新鲜度衰减项使用。
+                       -- 片段创建至今的天数,供下面的新鲜度衰减项使用。
                        EXTRACT(EPOCH FROM (now() - e.created_at)) / 86400 AS age_days
                 FROM knowledge_evidence e
-                WHERE e.kb_id=%s AND e.project_id=%s
-                  AND (e.department=%s OR e.department='general') AND e.status='READY'
+                WHERE e.kb_id=%s AND e.project_id=%s AND e.status='READY'
             )
             SELECT candidates.*,
                    -- 最终分数 = 语义相似度权重 0.75 + 词法相关性权重 0.25 + 新鲜度奖励。
-                   -- 新鲜度项为 0.1/(1+age_days/30)：当天约 0.1，30 天约 0.05，
-                   -- 90 天约 0.025，只用于同等相关内容的轻量排序，不应压过相关性。
-                   -- 0.75/0.25 是当前 MVP 的经验权重，不代表经过离线评测调优；
+                   -- 新鲜度项为 0.1/(1+age_days/30):当天约 0.1,30 天约 0.05,
+                   -- 90 天约 0.025,只用于同等相关内容的轻量排序,不应压过相关性。
+                   -- 0.75/0.25 是当前 MVP 的经验权重,不代表经过离线评测调优;
                    -- semantic_score 与 ts_rank 也并非天然处于完全相同的标度。
                    (0.75 * semantic_score + 0.25 * lexical_score +
                     0.1 / (1 + age_days / 30))::double precision AS score
-            -- 至少保留语义正相关或有词法命中的片段，排除两个信号都无效的结果。
+            -- 至少保留语义正相关或有词法命中的片段,排除两个信号都无效的结果。
             FROM candidates WHERE semantic_score > 0 OR lexical_score > 0
-            -- 按混合分降序，只返回调用方要求的 top_k 个片段。
+            -- 按混合分降序,只返回调用方要求的 top_k 个片段。
             ORDER BY score DESC LIMIT %s
         """,
-            (query_vector, question, kb_id, project_id, department, top_k),
+            (query_vector, question, kb_id, project_id, top_k),
         ).fetchall()
 
 
-def get_evidence(chunk_id: str, kb_id: str, project_id: str, department: str) -> DictRow | None:
-    with connect() as conn:
+def get_evidence(chunk_id: str, kb_id: str, project_id: str, scope_context: str) -> DictRow | None:
+    with connect(scope_context) as conn:
         return conn.execute(
             """
-            SELECT id, filename, chunk_index, content, summary, department, project_id,
+            SELECT id, filename, chunk_index, content, summary, access_scope, project_id,
                    document_id, source_type, source_uri, page, metadata, created_at
             FROM knowledge_evidence
-            WHERE id=%s AND kb_id=%s AND project_id=%s AND (department=%s OR department='general')
+            WHERE id=%s AND kb_id=%s AND project_id=%s
             """,
-            (chunk_id, kb_id, project_id, department),
+            (chunk_id, kb_id, project_id),
         ).fetchone()

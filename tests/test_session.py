@@ -6,7 +6,39 @@ import pytest
 
 from session import store, summarizer
 from session.main import ChatCompletion, app, chat_stream
+from session.rag_client import ask_stream as rag_ask_stream
 from session.summarizer import update_summary
+
+
+@pytest.mark.anyio
+async def test_rag_stream_forwards_opaque_scope_as_header(monkeypatch):
+    request = None
+
+    async def handler(next_request):
+        nonlocal request
+        request = next_request
+        return httpx.Response(200, text='data: {"type":"done"}\n\n')
+
+    transport = httpx.MockTransport(handler)
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr("session.rag_client.httpx.AsyncClient", lambda **kwargs: async_client(transport=transport))
+
+    events = [
+        event
+        async for event in rag_ask_stream(
+            question="问题",
+            history=[],
+            kb_id="company",
+            project_id="p-1",
+            department="engineering,general",
+            top_k=5,
+        )
+    ]
+
+    assert events == [{"type": "done"}]
+    assert request is not None
+    assert request.headers["x-scope-context"] == "engineering,general"
+    assert "department" not in json.loads(request.content)
 
 
 def _complete_generation(messages, session_id, generation_id, content, kb_id, project_id, department):

@@ -37,7 +37,7 @@ describe('chat session helpers', () => {
 	afterEach(() => vi.unstubAllGlobals());
 
 	it('creates a session with an unguessable capability token', () => {
-		const session = createLocalSession({ kbId: 'company', projectId: 'p-1', department: 'hr' });
+		const session = createLocalSession({ kbId: 'company', projectId: 'p-1', accessScope: 'hr' });
 		expect(session.id).toBeTruthy();
 		expect(session.token.length).toBeGreaterThanOrEqual(32);
 		expect(session.token).toMatch(/^[0-9a-f]+$/);
@@ -50,8 +50,12 @@ describe('chat session helpers', () => {
 	});
 
 	it('stores sessions independently and rejects malformed capability tokens', () => {
-		const first = createLocalSession({ kbId: 'company', projectId: 'p-1', department: 'hr' });
-		const second = createLocalSession({ kbId: 'company', projectId: 'p-2', department: 'general' });
+		const first = createLocalSession({ kbId: 'company', projectId: 'p-1', accessScope: 'hr' });
+		const second = createLocalSession({
+			kbId: 'company',
+			projectId: 'p-2',
+			accessScope: 'general'
+		});
 		expect(writeSession(first)).toBe(true);
 		expect(writeSession(second)).toBe(true);
 		localStorage.setItem(

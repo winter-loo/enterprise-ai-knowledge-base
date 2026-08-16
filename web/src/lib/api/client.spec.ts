@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, createRagClient, createSessionClient } from './client';
+import { ApiError, createAuthzClient, createRagClient, createSessionClient } from './client';
 
 describe('API errors', () => {
 	afterEach(() => {
@@ -89,7 +89,7 @@ describe('synchronous ask requests', () => {
 				question: '继续说明',
 				kb_id: 'company',
 				project_id: 'project-1',
-				department: 'engineering',
+				access_scope: 'engineering',
 				top_k: 4,
 				history
 			},
@@ -99,7 +99,10 @@ describe('synchronous ask requests', () => {
 		expect(fetch).toHaveBeenCalledOnce();
 		const [, init] = fetch.mock.calls[0];
 		expect(init?.signal).toBe(controller.signal);
-		expect(JSON.parse(String(init?.body))).toMatchObject({ history });
+		const body = JSON.parse(String(init?.body));
+		expect(body).toMatchObject({ history });
+		expect(body).not.toHaveProperty('access_scope');
+		expect(new Headers(init?.headers).get('x-scope-context')).toBe('engineering');
 	});
 });
 
@@ -134,5 +137,36 @@ describe('persistent chat sessions', () => {
 			't'.repeat(32)
 		);
 		expect(fetch.mock.calls[1][1]?.method).toBe('DELETE');
+	});
+});
+
+describe('authorization scopes', () => {
+	it('resolves an opaque visible scope for the authenticated principal', async () => {
+		const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					allowed: true,
+					project_id: 'p-1',
+					scope_context: 'engineering,general'
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			)
+		);
+		const client = createAuthzClient({ fetch });
+
+		await expect(
+			client.visibleScope({ principal: 'alice', kb_id: 'company', project_id: 'p-1' })
+		).resolves.toEqual({
+			allowed: true,
+			project_id: 'p-1',
+			scope_context: 'engineering,general'
+		});
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/v1/authz/visible-scope',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({ principal: 'alice', kb_id: 'company', project_id: 'p-1' })
+			})
+		);
 	});
 });

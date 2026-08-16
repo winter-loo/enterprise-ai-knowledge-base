@@ -33,7 +33,7 @@ dev = [
 import-documents = "rag.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["rag*", "session*", "shared*"]
+include = ["rag*", "session*", "shared*", "authz*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -48,9 +48,10 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "RUF"]
 ignore = ["RUF001"]
 
 [tool.basedpyright]
-include = ["rag", "session", "shared"]
+include = ["rag", "session", "shared", "authz"]
 pythonVersion = "3.11"
-typeCheckingMode = "strict"
+typeCheckingMode = "basic"
+strict = ["rag", "session", "shared", "authz"]
 venvPath = "."
 venv = ".venv"
 

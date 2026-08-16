@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ext", default="", help="只处理指定后缀，逗号分隔（如 md,txt,pdf）；默认处理所有可解析文件")
     parser.add_argument("--kb-id", default="company", help="知识库 id（默认 company）")
     parser.add_argument("--project-id", default="default", help="项目 id（默认 default）")
-    parser.add_argument("--department", default="general", help="部门范围（默认 general）")
+    parser.add_argument("--access-scope", default="general", help="不透明访问范围（默认 general，即公共范围）")
     parser.add_argument(
         "--chunking-strategy",
         choices=["fixed", "recursive", "semantic", "paragraph"],
@@ -58,7 +58,7 @@ def import_one(
     *,
     kb_id: str,
     project_id: str,
-    department: str,
+    access_scope: str,
     chunking_strategy: str,
 ) -> tuple[str, str]:
     """解析并写入单个文件, 返回 (状态, 说明); 状态为 imported、skipped 或 failed。"""
@@ -75,7 +75,7 @@ def import_one(
             project_id=project_id,
             document_id=uuid.uuid4().hex,
             filename=path.name,
-            department=department,
+            access_scope=access_scope,
             parser=parser,
             pdf_type=pdf_type,
             pages_needing_ocr=pages_needing_ocr,
@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
             path,
             kb_id=args.kb_id,
             project_id=resolved_project_id,
-            department=args.department,
+            access_scope=args.access_scope,
             chunking_strategy=args.chunking_strategy,
         )
         if status == "imported":

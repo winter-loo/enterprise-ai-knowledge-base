@@ -29,7 +29,7 @@
 			.getEvidence(chunkId, {
 				kb_id: scope.kbId,
 				project_id: scope.projectId,
-				department: scope.department
+				access_scope: scope.accessScope
 			})
 			.then((next) => {
 				if (!cancelled) detail = next;
@@ -123,8 +123,8 @@
 							<dd class="min-w-0 break-all">{detail.filename}</dd>
 						</div>
 						<div class="flex gap-3">
-							<dt class="w-24 shrink-0 text-[var(--ink-faint)]">部门范围</dt>
-							<dd>{detail.department}</dd>
+							<dt class="w-24 shrink-0 text-[var(--ink-faint)]">访问范围</dt>
+							<dd>{detail.access_scope}</dd>
 						</div>
 						{#if detail.page != null}
 							<div class="flex gap-3">

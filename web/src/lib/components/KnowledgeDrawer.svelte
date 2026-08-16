@@ -52,7 +52,6 @@
 		documents.filter(
 			(document) =>
 				document.project_id === scope.projectId &&
-				(document.department === scope.department || document.department === 'general') &&
 				document.filename.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
 		)
 	);
@@ -73,7 +72,7 @@
 			result = await rag.uploadDocument(file, {
 				kb_id: scope.kbId,
 				project_id: scope.projectId,
-				department: scope.department,
+				access_scope: 'general',
 				chunking_strategy: strategy
 			});
 		} catch (error) {
@@ -112,7 +111,7 @@
 				content: content.trim(),
 				kb_id: scope.kbId,
 				project_id: scope.projectId,
-				department: scope.department,
+				access_scope: 'general',
 				chunking_strategy: strategy
 			});
 		} catch (error) {
@@ -191,7 +190,7 @@
 											<CheckCircle2Icon class="size-3.5 shrink-0 text-[var(--success)]" />
 										</div>
 										<p class="mt-1 text-[11px] leading-5 text-[var(--ink-muted)]">
-											{document.chunk_count} 个片段 · {document.department} · {document.chunking_strategy ??
+											{document.chunk_count} 个片段 · {document.access_scope} · {document.chunking_strategy ??
 												'recursive'}
 										</p>
 										<div class="mt-2 flex flex-wrap gap-2">

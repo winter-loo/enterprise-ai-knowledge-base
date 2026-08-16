@@ -162,23 +162,6 @@
 		display: grid;
 		grid-template-columns: 17.5rem minmax(0, 1fr);
 	}
-	.scope-field {
-		position: relative;
-	}
-	.scope-field::after {
-		position: absolute;
-		bottom: -1px;
-		left: 1.25rem;
-		right: 1.25rem;
-		height: 1px;
-		content: '';
-		background: var(--signal);
-		transform: scaleX(0);
-		transition: transform 180ms ease;
-	}
-	.scope-field:focus-within::after {
-		transform: scaleX(1);
-	}
 	.session-row {
 		transition:
 			background 160ms ease,
@@ -189,7 +172,6 @@
 	}
 	.session-active {
 		background: rgba(255, 255, 255, 0.68);
-		box-shadow: inset 2px 0 0 var(--signal);
 	}
 	.prompt-card {
 		transition:

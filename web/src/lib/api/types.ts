@@ -15,9 +15,7 @@ export interface HealthResponse {
 	service: string;
 }
 
-export interface VisibleScopeRequest extends ScopePayload {
-	principal: string;
-}
+export type VisibleScopeRequest = ScopePayload;
 
 export interface VisibleScopeResponse {
 	allowed: boolean;

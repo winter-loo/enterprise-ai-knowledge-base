@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from authz import store
@@ -29,13 +29,11 @@ app = FastAPI(title="Enterprise AI Knowledge Base Authz", version="0.1.0", lifes
 
 
 class AuthorizeRequest(BaseModel):
-    principal: str = Field(min_length=1, max_length=200)
     action: str = Field(min_length=1, max_length=100)
     resource: dict[str, str | None] = Field(default_factory=dict)
 
 
 class VisibleScopeRequest(BaseModel):
-    principal: str = Field(min_length=1, max_length=200)
     kb_id: str = "company"
     project_id: str = "default"
 
@@ -77,16 +75,16 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/v1/authz/authorize")
-def authorize(payload: AuthorizeRequest) -> JsonObject:
+def authorize(payload: AuthorizeRequest, x_principal: str = Header(min_length=1, max_length=200)) -> JsonObject:
     kb_id = payload.resource.get("kb_id")
     project_id = payload.resource.get("project_id")
-    allowed = store.has_permission(payload.principal, payload.action, kb_id=kb_id, project_id=project_id)
+    allowed = store.has_permission(x_principal, payload.action, kb_id=kb_id, project_id=project_id)
     return {"allowed": allowed, "reason": None if allowed else "无权限执行该操作"}
 
 
 @app.post("/api/v1/authz/visible-scope")
-def visible_scope(payload: VisibleScopeRequest) -> JsonObject:
-    return store.visible_scope(payload.principal, payload.kb_id, payload.project_id)
+def visible_scope(payload: VisibleScopeRequest, x_principal: str = Header(min_length=1, max_length=200)) -> JsonObject:
+    return store.visible_scope(x_principal, payload.kb_id, payload.project_id)
 
 
 @app.post("/api/v1/authz/departments/validate")
@@ -100,7 +98,9 @@ def list_users() -> list[JsonObject]:
 
 
 @app.post("/api/v1/authz/users")
-def create_user(payload: UserCreate) -> JsonObject:
+def create_user(payload: UserCreate, x_principal: str = Header(min_length=1, max_length=200)) -> JsonObject:
+    if not store.has_permission(x_principal, "user:manage"):
+        raise HTTPException(403, "无权限管理用户")
     return dict(store.create_user(payload.id, payload.display_name))
 
 
@@ -110,7 +110,9 @@ def list_roles(kb_id: str = store.DEFAULT_KB_ID) -> list[JsonObject]:
 
 
 @app.post("/api/v1/authz/roles")
-def create_role(payload: RoleCreate) -> JsonObject:
+def create_role(payload: RoleCreate, x_principal: str = Header(min_length=1, max_length=200)) -> JsonObject:
+    if not store.has_permission(x_principal, "grant:manage", kb_id=payload.kb_id):
+        raise HTTPException(403, "无权限管理角色")
     try:
         return dict(store.create_role(payload.kb_id, payload.name, payload.description, payload.permissions))
     except ValueError as exc:
@@ -123,7 +125,10 @@ def list_grants(user_id: str | None = None) -> list[JsonObject]:
 
 
 @app.post("/api/v1/authz/grants")
-def create_grant(payload: GrantCreate) -> JsonObject:
+def create_grant(payload: GrantCreate, x_principal: str = Header(min_length=1, max_length=200)) -> JsonObject:
+    kb_id = store.project_kb_id(payload.project_id)
+    if kb_id is None or not store.has_permission(x_principal, "grant:manage", kb_id=kb_id, project_id=payload.project_id):
+        raise HTTPException(403, "无权限管理授权")
     try:
         return dict(store.create_grant(payload.user_id, payload.role_id, payload.project_id, payload.department_id))
     except ValueError as exc:
@@ -136,7 +141,9 @@ def list_departments(kb_id: str = store.DEFAULT_KB_ID) -> list[JsonObject]:
 
 
 @app.post("/api/v1/authz/departments")
-def create_department(payload: DepartmentCreate) -> JsonObject:
+def create_department(payload: DepartmentCreate, x_principal: str = Header(min_length=1, max_length=200)) -> JsonObject:
+    if not store.has_permission(x_principal, "department:manage", kb_id=payload.kb_id):
+        raise HTTPException(403, "无权限管理部门")
     try:
         return dict(store.create_department(payload.kb_id, payload.name, payload.parent_id, payload.is_public))
     except ValueError as exc:

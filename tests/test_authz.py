@@ -1,8 +1,13 @@
+import os
+
 import httpx
 import pytest
 
 from authz import store
 from authz.main import app
+from shared.scope_token import verify_scope
+
+os.environ.setdefault("AUTHZ_SIGNING_KEY", "test-signing-key-with-at-least-32-bytes")
 
 
 class _Rows(list):
@@ -59,7 +64,9 @@ def test_visible_scope_whole_project_grant_returns_full_scope(monkeypatch):
 
     scope = store.visible_scope("alice", "company", "p-1")
 
-    assert scope == {"allowed": True, "project_id": "p-1", "scope_context": store.SCOPE_ALL}
+    assert scope["allowed"] is True
+    assert scope["project_id"] == "p-1"
+    assert verify_scope(str(scope["scope_context"]), "company", "p-1") == store.SCOPE_ALL
 
 
 def test_visible_scope_superadmin_returns_full_scope(monkeypatch):
@@ -69,7 +76,8 @@ def test_visible_scope_superadmin_returns_full_scope(monkeypatch):
 
     scope = store.visible_scope("admin", "company", "p-1")
 
-    assert scope == {"allowed": True, "project_id": "p-1", "scope_context": store.SCOPE_ALL}
+    assert scope["allowed"] is True
+    assert verify_scope(str(scope["scope_context"]), "company", "p-1") == store.SCOPE_ALL
 
 
 def test_visible_scope_department_grant_returns_opaque_scope_context(monkeypatch):
@@ -84,7 +92,7 @@ def test_visible_scope_department_grant_returns_opaque_scope_context(monkeypatch
 
     assert scope["allowed"] is True
     assert scope["project_id"] == "p-1"
-    assert scope["scope_context"] == "eng,eng-mobile,general"
+    assert verify_scope(str(scope["scope_context"]), "company", "p-1") == "eng,eng-mobile,general"
 
 
 def test_visible_scope_denies_without_grant(monkeypatch):
@@ -103,7 +111,7 @@ def test_visible_scope_unknown_project_has_no_canonical_id(monkeypatch):
 
     scope = store.visible_scope("alice", "company", "other")
 
-    assert scope == {"allowed": False, "project_id": None, "scope_context": store.SCOPE_ALL}
+    assert scope == {"allowed": False, "project_id": None, "scope_context": ""}
 
 
 def test_visible_scope_default_alias_resolves_to_first_project(monkeypatch):
@@ -115,7 +123,9 @@ def test_visible_scope_default_alias_resolves_to_first_project(monkeypatch):
 
     scope = store.visible_scope("alice", "company", "default")
 
-    assert scope == {"allowed": True, "project_id": "p-1", "scope_context": store.SCOPE_ALL}
+    assert scope["allowed"] is True
+    assert scope["project_id"] == "p-1"
+    assert verify_scope(str(scope["scope_context"]), "company", "p-1") == store.SCOPE_ALL
 
 
 def test_has_permission_checks_role_permissions_on_project(monkeypatch):
@@ -154,6 +164,50 @@ def test_department_exists_checks_departments_table(monkeypatch):
     assert store.department_exists("company", "eng") is False
 
 
+def test_apply_rls_fails_when_rag_schema_is_not_ready(monkeypatch):
+    monkeypatch.setattr(store, "_table_exists", lambda _conn, _name: False)
+    with pytest.raises(RuntimeError, match="请先启动 RAG"):
+        store.apply_rls(object())  # type: ignore[arg-type]
+
+
+def test_scope_capability_rejects_tampering(monkeypatch):
+    monkeypatch.setenv("AUTHZ_SIGNING_KEY", "tamper-test-signing-key-at-least-32")
+    connection = _FakeConnection(
+        projects=[{"id": "p-1", "kb_id": "company"}],
+        grants=[{"user_id": "alice", "project_id": "p-1", "department_id": None}],
+    )
+    _connect(monkeypatch, connection)
+    token = str(store.visible_scope("alice", "company", "p-1")["scope_context"])
+
+    with pytest.raises(ValueError, match="invalid scope capability"):
+        verify_scope(f"{token[:-1]}x", "company", "p-1")
+    with pytest.raises(ValueError, match="invalid scope capability"):
+        verify_scope(token, "company", "p-2")
+
+
+def test_create_grant_rejects_cross_kb_role(monkeypatch):
+    class GrantConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def execute(self, query, params):
+            if "FROM users" in query:
+                return _Rows([{"id": "alice"}])
+            if "FROM roles" in query:
+                return _Rows([{"id": "kb-a:viewer", "kb_id": "kb-a"}])
+            if "FROM projects" in query:
+                return _Rows([{"id": "p-b", "kb_id": "kb-b"}])
+            return _Rows([])
+
+    _connect(monkeypatch, GrantConnection())
+
+    with pytest.raises(ValueError, match="角色与项目不属于同一知识库"):
+        store.create_grant("alice", "kb-a:viewer", "p-b")
+
+
 @pytest.fixture
 def client(monkeypatch):
     def visible_scope(user_id, kb_id, project_id):
@@ -169,6 +223,7 @@ def client(monkeypatch):
         lambda user_id, permission, kb_id=None, project_id=None: user_id == "root" or permission == "retrieve",
     )
     monkeypatch.setattr(store, "visible_scope", visible_scope)
+    monkeypatch.setattr(store, "project_kb_id", lambda project_id: "company" if project_id == "p-1" else None)
     monkeypatch.setattr(store, "department_exists", lambda kb_id, department: department == "general")
     monkeypatch.setattr(store, "list_users", lambda: [{"id": "alice", "display_name": "Alice", "is_superadmin": False}])
     monkeypatch.setattr(store, "create_user", lambda user_id, display_name="": {"id": user_id, "display_name": display_name, "is_superadmin": False})
@@ -214,9 +269,11 @@ async def test_health(client):
 async def test_authorize_returns_decision(client):
     async with client as http:
         allowed = await http.post(
-            "/api/v1/authz/authorize", json={"principal": "alice", "action": "retrieve", "resource": {"kb_id": "company", "project_id": "p-1"}}
+            "/api/v1/authz/authorize",
+            json={"action": "retrieve", "resource": {"kb_id": "company", "project_id": "p-1"}},
+            headers={"x-principal": "alice"},
         )
-        denied = await http.post("/api/v1/authz/authorize", json={"principal": "alice", "action": "kb:create", "resource": {}})
+        denied = await http.post("/api/v1/authz/authorize", json={"action": "kb:create", "resource": {}}, headers={"x-principal": "alice"})
     assert allowed.json()["allowed"] is True
     assert denied.json()["allowed"] is False
     assert denied.json()["reason"] is not None
@@ -225,9 +282,9 @@ async def test_authorize_returns_decision(client):
 @pytest.mark.anyio
 async def test_visible_scope_returns_scope(client):
     async with client as http:
-        granted = await http.post("/api/v1/authz/visible-scope", json={"principal": "alice", "kb_id": "company", "project_id": "p-1"})
-        denied = await http.post("/api/v1/authz/visible-scope", json={"principal": "mallory", "kb_id": "company", "project_id": "p-1"})
-        unknown = await http.post("/api/v1/authz/visible-scope", json={"principal": "alice", "kb_id": "company", "project_id": "unknown"})
+        granted = await http.post("/api/v1/authz/visible-scope", json={"kb_id": "company", "project_id": "p-1"}, headers={"x-principal": "alice"})
+        denied = await http.post("/api/v1/authz/visible-scope", json={"kb_id": "company", "project_id": "p-1"}, headers={"x-principal": "mallory"})
+        unknown = await http.post("/api/v1/authz/visible-scope", json={"kb_id": "company", "project_id": "unknown"}, headers={"x-principal": "alice"})
     assert granted.json() == {"allowed": True, "project_id": "p-1", "scope_context": "general,engineering"}
     assert denied.json()["allowed"] is False
     assert unknown.json()["project_id"] is None
@@ -244,13 +301,22 @@ async def test_departments_validate(client):
 async def test_user_role_grant_department_crud(client):
     async with client as http:
         users = await http.get("/api/v1/authz/users")
-        created_user = await http.post("/api/v1/authz/users", json={"id": "bob", "display_name": "Bob"})
+        admin_headers = {"x-principal": "root"}
+        created_user = await http.post("/api/v1/authz/users", json={"id": "bob", "display_name": "Bob"}, headers=admin_headers)
         roles = await http.get("/api/v1/authz/roles")
-        created_role = await http.post("/api/v1/authz/roles", json={"kb_id": "company", "name": "editor", "permissions": ["document:upload"]})
+        created_role = await http.post(
+            "/api/v1/authz/roles",
+            json={"kb_id": "company", "name": "editor", "permissions": ["document:upload"]},
+            headers=admin_headers,
+        )
         grants = await http.get("/api/v1/authz/grants")
-        created_grant = await http.post("/api/v1/authz/grants", json={"user_id": "alice", "role_id": "company:viewer", "project_id": "p-1"})
+        created_grant = await http.post(
+            "/api/v1/authz/grants",
+            json={"user_id": "alice", "role_id": "company:viewer", "project_id": "p-1"},
+            headers=admin_headers,
+        )
         departments = await http.get("/api/v1/authz/departments")
-        created_department = await http.post("/api/v1/authz/departments", json={"kb_id": "company", "name": "研发"})
+        created_department = await http.post("/api/v1/authz/departments", json={"kb_id": "company", "name": "研发"}, headers=admin_headers)
 
     assert users.json()[0]["id"] == "alice"
     assert created_user.json()["id"] == "bob"
@@ -260,3 +326,16 @@ async def test_user_role_grant_department_crud(client):
     assert created_grant.json()["user_id"] == "alice"
     assert departments.json()[0]["name"] == "研发"
     assert created_department.json()["is_public"] is False
+
+
+@pytest.mark.anyio
+async def test_admin_mutations_require_management_permission(client):
+    async with client as http:
+        response = await http.post(
+            "/api/v1/authz/grants",
+            json={"user_id": "alice", "role_id": "company:viewer", "project_id": "p-1"},
+            headers={"x-principal": "alice"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "无权限管理授权"

@@ -1,4 +1,5 @@
 import json
+import os
 
 import httpx
 import pytest
@@ -8,8 +9,12 @@ from rag import store
 from rag.chunking import _token_count
 from rag.main import AskRequest, app, ask_stream, build_prompt, llm_answer, split_text, stream_content
 from shared.openai_responses import response_answer_text
+from shared.scope_token import sign_scope
+
+os.environ.setdefault("AUTHZ_SIGNING_KEY", "test-signing-key-with-at-least-32-bytes")
 
 SOURCES = [{"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "score": 0.9, "content": "重启服务前先保存配置。", "summary": "重启前保存配置"}]
+SCOPE_TOKEN = sign_scope("company", "p-1", "*")
 
 
 @pytest.fixture
@@ -54,7 +59,7 @@ def client(monkeypatch):
         },
     )
     monkeypatch.setattr(store, "search", lambda question, kb_id, project_id, scope_context, top_k: SOURCES)
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"x-scope-context": SCOPE_TOKEN})
 
 
 def test_split_text_overlaps_chunks():
@@ -555,8 +560,8 @@ async def test_ask_stream_rejects_truncated_or_malformed_upstream(monkeypatch, l
     assert f'"message": "{message}"' in events[-1]
 
 
-# --- RLS 接缝:不透明 x-scope-context 头透传(ADR 0004 D5) ---
-# RAG 不做授权判断,只把调用方传来的 scope_context 原样交给 store 交给 RLS。
+# --- RLS 接缝:签名 x-scope-context capability 验证(ADR 0004 D5) ---
+# RAG 不计算授权,只验证 authz 签名并把 capability 内的范围交给 RLS。
 
 
 @pytest.mark.anyio
@@ -573,7 +578,7 @@ async def test_retrieve_passes_scope_context_through(client, monkeypatch):
         response = await http.post(
             "/api/retrieve",
             json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"},
-            headers={"x-scope-context": "eng,general"},
+            headers={"x-scope-context": sign_scope("company", "p-1", "eng,general")},
         )
 
     assert response.status_code == 200
@@ -582,23 +587,15 @@ async def test_retrieve_passes_scope_context_through(client, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_retrieve_defaults_to_full_scope_without_header(client, monkeypatch):
-    captured = {}
-
-    def fake_search(question, kb_id, project_id, scope_context, top_k):
-        captured.update(scope_context=scope_context)
-        return SOURCES
-
-    monkeypatch.setattr(store, "search", fake_search)
-
+async def test_retrieve_rejects_missing_scope_capability(client):
     async with client as http:
         response = await http.post(
             "/api/retrieve",
             json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"},
+            headers={"x-scope-context": ""},
         )
 
-    assert response.status_code == 200
-    assert captured["scope_context"] == store.SCOPE_ALL
+    assert response.status_code == 401
 
 
 @pytest.mark.anyio
@@ -614,7 +611,7 @@ async def test_evidence_passes_scope_context_through(client, monkeypatch):
         response = await http.get(
             "/api/evidence/chunk-1",
             params={"kb_id": "company", "project_id": "p-1"},
-            headers={"x-scope-context": "general"},
+            headers={"x-scope-context": sign_scope("company", "p-1", "general")},
         )
 
     assert response.status_code == 404  # fake 返回 None,但 scope_context 已透传

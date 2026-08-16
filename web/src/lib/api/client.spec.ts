@@ -154,9 +154,7 @@ describe('authorization scopes', () => {
 		);
 		const client = createAuthzClient({ fetch });
 
-		await expect(
-			client.visibleScope({ principal: 'alice', kb_id: 'company', project_id: 'p-1' })
-		).resolves.toEqual({
+		await expect(client.visibleScope({ kb_id: 'company', project_id: 'p-1' })).resolves.toEqual({
 			allowed: true,
 			project_id: 'p-1',
 			scope_context: 'engineering,general'
@@ -165,7 +163,7 @@ describe('authorization scopes', () => {
 			'/api/v1/authz/visible-scope',
 			expect.objectContaining({
 				method: 'POST',
-				body: JSON.stringify({ principal: 'alice', kb_id: 'company', project_id: 'p-1' })
+				body: JSON.stringify({ kb_id: 'company', project_id: 'p-1' })
 			})
 		);
 	});

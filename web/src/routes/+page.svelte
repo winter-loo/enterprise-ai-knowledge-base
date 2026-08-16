@@ -38,7 +38,6 @@
 	import SessionSidebar from '$lib/components/SessionSidebar.svelte';
 
 	const transport = new PythonSseChatTransport();
-	const principal = import.meta.env.VITE_AUTHZ_PRINCIPAL?.trim() || 'admin';
 	const emptyScope: ChatScope = { kbId: '', projectId: '', accessScope: '' };
 	const placeholderSession: LocalChatSession = {
 		id: 'initial',
@@ -167,7 +166,7 @@
 		signal?: AbortSignal
 	): Promise<ChatScope> {
 		const resolved = await authz.visibleScope(
-			{ principal, kb_id: nextKbId, project_id: nextProjectId },
+			{ kb_id: nextKbId, project_id: nextProjectId },
 			{ signal }
 		);
 		if (!resolved.allowed || !resolved.project_id || !resolved.scope_context) {

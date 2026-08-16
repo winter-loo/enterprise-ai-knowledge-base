@@ -57,6 +57,9 @@ def now() -> str:
 
 def init_db() -> None:
     with connect() as conn:
+        legacy = conn.execute("SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_evidence' AND column_name='department'").fetchone()
+        if legacy is not None:
+            _ = conn.execute("DROP TABLE knowledge_evidence CASCADE")
         _ = conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         _ = conn.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_bases (

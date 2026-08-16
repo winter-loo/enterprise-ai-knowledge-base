@@ -36,7 +36,7 @@ The root cause is that three distinct concerns were fused into one triple: **ide
 ```text
 GET  /api/v1/authz/health
 POST /api/v1/authz/authorize            # {principal, action, resource} -> {allowed, reason?}
-POST /api/v1/authz/visible-scope        # {principal, kb_id, project_id} -> {allowed, project_id, scope_context}
+POST /api/v1/authz/visible-scope        # x-principal + {kb_id, project_id} -> signed scope_context capability
 
 # Admin CRUD (authz owns these tables)
 GET/POST /api/v1/authz/users
@@ -70,10 +70,10 @@ A chunk's visibility is derived from `grants` joined through `departments` (tree
 ## Consequences
 
 - **Trust boundary moves, it does not disappear.** The edge must strip any client-supplied `x-principal` and inject the authenticated one; until SSO exists, authz is the trust anchor for identity, and the edge is responsible for who may claim a principal.
-- **The retrieval hot path stays local.** RAG makes no authz round trip: the scope arrives as the opaque `x-scope-context` header and is applied via `set_config` before each evidence query. The authz gate (or client) is responsible for calling `visible-scope` and forwarding the result.
+- **The retrieval hot path stays local.** RAG makes no authz round trip: a short-lived HMAC-signed capability arrives in `x-scope-context`. RAG verifies its signature, expiry, and KB/Project binding, then applies the embedded scope via `set_config`. The trusted gateway injects `x-principal`; browsers never choose the principal or construct a scope.
 - **All permission logic concentrates in authz.** Role resolution, department-tree inheritance, `default`/`general` canonicalization, and the RLS policy live in exactly one module. RAG's `ensure_kb`/`ensure_project`-style existence checks remain only as its own relevance-boundary validation. The deletion test passes: without authz, the authorization logic would reappear across every RAG, session, and web call site.
 - **The interface is small and the module is deep.** Callers learn `authorize` and `visible_scope`; RAG learns only "pass `x-scope-context` through to the database". Behind them sit role resolution, department trees, and the RLS policy. Tests cross the same seam: authz unit tests cover tree inheritance and grant precedence; RAG tests assert its retrieval SQL contains no permission predicate and that the scope header is forwarded verbatim.
-- **RAG is a permission-free engine.** It no longer imports or calls authz; `retrieve`/`ask`/`evidence` default `x-scope-context` to `*` (project-wide) and write endpoints are trusted-edge until the authz gate is wired in Phase 3.
+- **RAG is a permission-free engine.** It does not resolve grants or call authz. `retrieve`/`ask`/`evidence` fail closed unless `x-scope-context` contains a valid signed capability; write endpoints remain trusted-edge until their authorization gate is wired.
 - **Phase 2 leaves org-listing endpoints unfiltered.** `GET /api/knowledge-bases`, `/api/projects`, and `/api/documents` still return their full rows; they expose names and ids only, not content, and Phase 3 filters them by the principal's grants.
 
 ## Migration

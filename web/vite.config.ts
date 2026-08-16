@@ -20,7 +20,14 @@ export default defineConfig({
 	],
 	server: {
 		proxy: {
-			'/api/v1/authz': 'http://127.0.0.1:8012',
+			'/api/v1/authz': {
+				target: 'http://127.0.0.1:8012',
+				configure(proxy) {
+					proxy.on('proxyReq', (request) => {
+						request.setHeader('x-principal', process.env.AUTHZ_DEV_PRINCIPAL?.trim() || 'admin');
+					});
+				}
+			},
 			'/api/v1/chat': 'http://127.0.0.1:8011',
 			'/api': 'http://127.0.0.1:8010'
 		}

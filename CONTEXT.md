@@ -57,7 +57,7 @@ The effective access a Principal holds within a Project: the set of Departments 
 _Avoid_: 权限范围, scope filter, predicate
 
 **Scope Context**:
-The opaque string form of a Visible Scope passed into RAG (the `x-scope-context` header, set as the `app.visible_scope` session setting): `*` for a project-wide Grant, otherwise a comma-joined list of visible department ids. RAG treats it as a black box.
+An HMAC-signed, short-lived capability passed in the `x-scope-context` header. It binds the Visible Scope to one knowledge base and canonical project. RAG verifies the capability before applying its embedded `*` or department-id set to `app.visible_scope`.
 _Avoid_: scope, predicate, filter
 
 **Retrieve**:

@@ -1,6 +1,7 @@
 .PHONY: build check compile dev-authz dev-rag dev-session dev-web format install-hooks lint test typecheck web-install
 
 WEB_DEPENDENCY_STATE := web/node_modules/.package-lock.json
+AUTHZ_SIGNING_KEY ?= local-development-signing-key-change-me
 
 $(WEB_DEPENDENCY_STATE): web/package.json web/package-lock.json
 	npm ci --prefix web
@@ -34,10 +35,10 @@ build: web-install
 check: web-install lint typecheck test compile build
 
 dev-authz:
-	uv run uvicorn authz.main:app --host 127.0.0.1 --port 8012 --reload
+	AUTHZ_SIGNING_KEY=$(AUTHZ_SIGNING_KEY) uv run uvicorn authz.main:app --host 127.0.0.1 --port 8012 --reload
 
 dev-rag:
-	uv run uvicorn rag.main:app --host 127.0.0.1 --port 8010 --reload
+	AUTHZ_SIGNING_KEY=$(AUTHZ_SIGNING_KEY) uv run uvicorn rag.main:app --host 127.0.0.1 --port 8010 --reload
 
 dev-session:
 	uv run uvicorn session.main:app --host 127.0.0.1 --port 8011 --reload

@@ -13,7 +13,7 @@ npm run dev
 
 Vite 会把 `/api` 代理到 `http://127.0.0.1:8010`。
 `/api/v1/chat` 和 `/api/v1/authz` 会分别代理到 8011、8012。开发环境可用
-`VITE_AUTHZ_PRINCIPAL` 指定当前身份；未配置时与 authz 的引导管理员一致，使用 `admin`。
+`AUTHZ_DEV_PRINCIPAL` 指定由开发代理注入的当前身份；未配置时与 authz 的引导管理员一致，使用 `admin`。
 
 ## Building
 

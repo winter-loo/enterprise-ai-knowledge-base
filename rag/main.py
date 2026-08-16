@@ -30,6 +30,7 @@ from shared.openai_responses import (
 from shared.openai_responses import (
     stream_delta as stream_content,
 )
+from shared.scope_token import verify_scope
 
 JsonObject = dict[str, object]
 
@@ -139,11 +140,15 @@ def resolve_project_id(kb_id: str, project_id: str) -> str:
 def resolve_and_search(question: str, kb_id: str, project_id: str, scope_context: str, top_k: int) -> list[DictRow]:
     """Canonicalize the project and run retrieval in one synchronous worker-pool call.
 
-    scope_context 是 authz 计算好的不透明可见范围,原样透传给 store 交给 RLS;
-    RAG 不解释它,也不做任何授权判断。
+    scope_context 是 authz 签发的不透明 capability;RAG 只验证签名与目标绑定,
+    再把其中的可见范围交给 RLS,不重新计算权限。
     """
     resolved_project_id = resolve_project_id(kb_id, project_id)
-    return store.search(question, kb_id, resolved_project_id, scope_context, top_k)
+    try:
+        visible_scope = verify_scope(scope_context, kb_id, resolved_project_id)
+    except ValueError as exc:
+        raise HTTPException(401, "访问范围凭证无效或已过期") from exc
+    return store.search(question, kb_id, resolved_project_id, visible_scope, top_k)
 
 
 def extract_text(filename: str, data: bytes) -> str:
@@ -394,19 +399,23 @@ def get_evidence(
     chunk_id: str,
     kb_id: str,
     project_id: str,
-    x_scope_context: Annotated[str, Header()] = store.SCOPE_ALL,
+    x_scope_context: Annotated[str, Header()] = "",
 ) -> JsonObject:
     # 行级可见性由 authz 的 RLS 策略强制;这里只透传不透明 scope_context,
     # 一个 chunk id 无法读到可见范围之外的内容。
     resolved_project_id = resolve_project_id(kb_id, project_id)
-    row = store.get_evidence(chunk_id, kb_id, resolved_project_id, x_scope_context)
+    try:
+        visible_scope = verify_scope(x_scope_context, kb_id, resolved_project_id)
+    except ValueError as exc:
+        raise HTTPException(401, "访问范围凭证无效或已过期") from exc
+    row = store.get_evidence(chunk_id, kb_id, resolved_project_id, visible_scope)
     if not row:
         raise HTTPException(404, "参考资料片段不存在")
     return dict(row)
 
 
 @app.post("/api/retrieve")
-def retrieve(payload: RetrieveRequest, x_scope_context: Annotated[str, Header()] = store.SCOPE_ALL) -> JsonObject:
+def retrieve(payload: RetrieveRequest, x_scope_context: Annotated[str, Header()] = "") -> JsonObject:
     sources = resolve_and_search(payload.question, payload.kb_id, payload.project_id, x_scope_context, payload.top_k)
     chunks = [
         {
@@ -431,7 +440,7 @@ def resolve_scope(payload: ScopeResolve) -> dict[str, str]:
 
 
 @app.post("/api/ask", response_model=None)
-async def ask(payload: AskRequest, x_scope_context: Annotated[str, Header()] = store.SCOPE_ALL) -> JsonObject | StreamingResponse:
+async def ask(payload: AskRequest, x_scope_context: Annotated[str, Header()] = "") -> JsonObject | StreamingResponse:
     # Retrieval performs synchronous embedding and PostgreSQL calls; keep it off
     # the event loop so a slow search cannot starve concurrent answer streams.
     sources = await run_in_threadpool(resolve_and_search, payload.question, payload.kb_id, payload.project_id, x_scope_context, payload.top_k)

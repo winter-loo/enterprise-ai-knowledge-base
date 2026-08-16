@@ -22,6 +22,8 @@ from typing import cast
 import psycopg
 from psycopg.rows import DictRow, dict_row
 
+from shared.scope_token import sign_scope
+
 # 公共部门是内置的 well-known id:在「有权限访问的项目内」对所有 principal 可见,
 # 不需要显式授权。它对应旧模型的 `general` 字符串,因此存量 evidence 无需迁移。
 PUBLIC_DEPARTMENT = "general"
@@ -91,13 +93,13 @@ def apply_rls(conn: psycopg.Connection[DictRow]) -> None:
     (fail-closed)。写策略放行,写权限由应用层 authorize 门面把关,RLS 不做行级写过滤。
 
     knowledge_evidence 归 rag 服务所有,但它的可见性语义归 authz 数据面所有;
-    authz 只读访问该表以应用 RLS,绝不写入其内容。表尚未创建时跳过(等待 rag 先启动)。
+    authz 只读访问该表以应用 RLS,绝不写入其内容。表必须先由 RAG 创建;启动顺序
+    错误时 authz 失败退出,由进程编排器重试,避免无 RLS 运行。
     """
     if not _table_exists(conn, "knowledge_evidence"):
-        return
+        raise RuntimeError("knowledge_evidence 尚未创建；请先启动 RAG，再重启 authz")
     if not _column_exists(conn, "knowledge_evidence", "access_scope"):
-        # 表存在但还没有 access_scope 列(旧 schema), 跳过; 等 rag 用新 schema 重建。
-        return
+        raise RuntimeError("knowledge_evidence 仍是旧结构；请先由 RAG 重建")
     _ = conn.execute("""
         ALTER TABLE knowledge_evidence ENABLE ROW LEVEL SECURITY;
         ALTER TABLE knowledge_evidence FORCE ROW LEVEL SECURITY;
@@ -223,10 +225,17 @@ def create_grant(user_id: str, role_id: str, project_id: str, department_id: str
         role = conn.execute("SELECT * FROM roles WHERE id=%s", (role_id,)).fetchone()
         if role is None:
             raise ValueError(f"角色不存在：{role_id}")
+        project = conn.execute("SELECT * FROM projects WHERE id=%s", (project_id,)).fetchone()
+        if project is None:
+            raise ValueError(f"项目不存在：{project_id}")
+        if role["kb_id"] != project["kb_id"]:
+            raise ValueError("角色与项目不属于同一知识库")
         if department_id is not None and department_id != PUBLIC_DEPARTMENT:
-            department_row = conn.execute("SELECT 1 FROM departments WHERE id=%s", (department_id,)).fetchone()
+            department_row = conn.execute("SELECT * FROM departments WHERE id=%s", (department_id,)).fetchone()
             if department_row is None:
                 raise ValueError(f"部门不存在：{department_id}")
+            if department_row["kb_id"] != project["kb_id"]:
+                raise ValueError("部门与项目不属于同一知识库")
         grant_id = uuid.uuid4().hex
         _ = conn.execute(
             "INSERT INTO grants(id, user_id, role_id, project_id, department_id, created_at) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
@@ -290,6 +299,12 @@ def canonical_project_id(kb_id: str, project_id: str) -> str | None:
     return None if row is None else str(row["id"])
 
 
+def project_kb_id(project_id: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute("SELECT kb_id FROM projects WHERE id=%s", (project_id,)).fetchone()
+    return None if row is None else str(row["kb_id"])
+
+
 def _department_descendants(conn: psycopg.Connection[DictRow], kb_id: str, department_id: str) -> list[str]:
     rows = conn.execute(
         """
@@ -308,27 +323,26 @@ def visible_scope(user_id: str, kb_id: str, project_id: str) -> dict[str, object
     """返回 principal 对该项目的数据可见范围,以不透明 scope_context 表达(ADR 0004 D5)。
 
     allowed=False 表示无权访问;project_id 为规范项目 id(未知项目时为 None);
-    scope_context 是不透明字符串,由调用方透传给 RAG,RAG 再 set_config 进数据库
-    事务交给 RLS 行级过滤——RAG 不知道也不解释其含义。scope_context 取值:
-    SCOPE_ALL('*') 表示全项目可见;否则为逗号分隔的可见部门 id 集合(含公共部门
-    与授权部门的全部子树)。
+    scope_context 是绑定 kb/project 的短时签名 capability,由调用方透传给 RAG。
+    RAG 验证后取出内部范围交给 RLS: SCOPE_ALL('*') 表示全项目可见;否则为
+    逗号分隔的可见部门 id 集合(含公共部门与授权部门的全部子树)。
     """
     canonical = canonical_project_id(kb_id, project_id)
     if canonical is None:
-        return {"allowed": False, "project_id": None, "scope_context": SCOPE_ALL}
+        return {"allowed": False, "project_id": None, "scope_context": ""}
     if is_superadmin(user_id):
-        return {"allowed": True, "project_id": canonical, "scope_context": SCOPE_ALL}
+        return {"allowed": True, "project_id": canonical, "scope_context": sign_scope(kb_id, canonical, SCOPE_ALL)}
     with connect() as conn:
         grants = conn.execute("SELECT department_id FROM grants WHERE user_id=%s AND project_id=%s", (user_id, canonical)).fetchall()
     if not grants:
-        return {"allowed": False, "project_id": canonical, "scope_context": SCOPE_ALL}
+        return {"allowed": False, "project_id": canonical, "scope_context": ""}
     if any(row["department_id"] is None for row in grants):
-        return {"allowed": True, "project_id": canonical, "scope_context": SCOPE_ALL}
+        return {"allowed": True, "project_id": canonical, "scope_context": sign_scope(kb_id, canonical, SCOPE_ALL)}
     departments = {PUBLIC_DEPARTMENT}
     with connect() as conn:
         for row in grants:
             departments.update(_department_descendants(conn, kb_id, cast(str, row["department_id"])))
-    return {"allowed": True, "project_id": canonical, "scope_context": ",".join(sorted(departments))}
+    return {"allowed": True, "project_id": canonical, "scope_context": sign_scope(kb_id, canonical, ",".join(sorted(departments)))}
 
 
 def has_permission(user_id: str, permission: str, kb_id: str | None = None, project_id: str | None = None) -> bool:
@@ -347,8 +361,8 @@ def has_permission(user_id: str, permission: str, kb_id: str | None = None, proj
             return False
         with connect() as conn:
             row = conn.execute(
-                "SELECT count(*) AS n FROM grants g JOIN roles r ON g.role_id=r.id WHERE g.user_id=%s AND g.project_id=%s AND %s = ANY(r.permissions)",
-                (user_id, canonical, permission),
+                "SELECT count(*) AS n FROM grants g JOIN roles r ON g.role_id=r.id WHERE g.user_id=%s AND g.project_id=%s AND r.kb_id=%s AND %s = ANY(r.permissions)",
+                (user_id, canonical, kb_id, permission),
             ).fetchone()
     elif kb_id is not None:
         with connect() as conn:

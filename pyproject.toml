@@ -29,6 +29,9 @@ dev = [
     "ruff>=0.12,<1",
 ]
 
+[project.scripts]
+import-documents = "rag.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["rag*", "session*"]
 

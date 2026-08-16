@@ -62,6 +62,30 @@ qwen3-embedding:0.6b
 
 文档入库使用 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL` 调用 OpenAI-compatible `/chat/completions`，为每个片段生成忠实摘要；未配置或单片摘要失败时，该片摘要留空且索引继续。问答生成复用相同配置，`LLM_MODEL` 默认为 `gpt-4o-mini`。
 
+## 命令行批量导入
+
+把一个目录下的文档批量写入知识库：
+
+```bash
+# 递归导入目录下所有可解析文件
+uv run python -m rag.cli /path/to/docs
+
+# 只导入指定后缀的文件
+uv run python -m rag.cli /path/to/docs --ext md,txt,pdf
+
+# 指定范围与切片策略
+uv run python -m rag.cli /path/to/docs --kb-id company --project-id default \
+  --department general --chunking-strategy recursive
+```
+
+安装依赖后也可用控制台命令：
+
+```bash
+uv run import-documents /path/to/docs --ext md,pdf
+```
+
+参数：`directory` 为要扫描的目录（递归读取其中所有文件）；`--ext` 为逗号分隔的后缀列表，缺省处理所有可解析文件；`--kb-id`、`--project-id`、`--department`、`--chunking-strategy` 与上传接口一致，默认分别为 `company`、`default`、`general`、`recursive`。批量导入是尽力而为的：单个文件解析或写入失败会跳过并继续，结束后打印「导入 / 跳过 / 失败」统计，任一文件失败时退出码为 1。
+
 ## API
 
 RAG 服务：

@@ -45,6 +45,26 @@ def test_main_imports_all_files_in_directory(tmp_path, monkeypatch, capsys):
     assert "完成：导入 2 个，跳过 0 个，失败 0 个" in capsys.readouterr().out
 
 
+def test_main_displays_file_and_indexing_progress(tmp_path, monkeypatch, capsys):
+    (tmp_path / "a.md").write_text("部署步骤。")
+    _mock_scope(monkeypatch)
+    monkeypatch.setattr("rag.main.parse_document", lambda filename, data: (data.decode(), "plain-text", None, []))
+    monkeypatch.setattr("rag.main.chunk_document", lambda text, strategy: [text, text])
+
+    def insert(**kwargs):
+        kwargs["on_progress"]({"stage": "embedding", "message": "生成向量", "completed": 1, "total": 2, "percent": 50})
+        kwargs["on_progress"]({"stage": "storing", "message": "写入索引", "completed": 2, "total": 2, "percent": 90})
+        return {"id": kwargs["document_id"]}
+
+    monkeypatch.setattr(store, "insert_document", insert)
+
+    assert main([str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "[1/1] a.md · 生成向量 1/2 (50%)" in output
+    assert "[1/1] a.md · 写入索引 2/2 (90%)" in output
+    assert "[1/1] a.md · 索引完成 2/2 (100%)" in output
+
+
 def test_main_limits_to_requested_extensions(tmp_path, monkeypatch):
     (tmp_path / "a.md").write_text("a")
     (tmp_path / "b.txt").write_text("b")

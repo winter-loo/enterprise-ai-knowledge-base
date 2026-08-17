@@ -60,16 +60,21 @@ def import_one(
     project_id: str,
     access_scope: str,
     chunking_strategy: str,
+    on_progress: store.ProgressCallback | None = None,
 ) -> tuple[str, str]:
     """解析并写入单个文件, 返回 (状态, 说明); 状态为 imported、skipped 或 failed。"""
     if path.suffix.lower() not in rag_main.SUPPORTED_SUFFIXES:
         return "skipped", "不支持的文档格式"
     try:
+        if on_progress is not None:
+            on_progress({"stage": "parsing", "message": "解析文档", "completed": 0, "total": 1, "percent": 10})
         data = path.read_bytes()
         text, parser, pdf_type, pages_needing_ocr = rag_main.parse_document(path.name, data)
         chunks = rag_main.chunk_document(text, chunking_strategy)
         if not chunks:
             return "skipped", "没有可索引的文本"
+        if on_progress is not None:
+            on_progress({"stage": "chunking", "message": "切分文档", "completed": len(chunks), "total": len(chunks), "percent": 30})
         store.insert_document(
             kb_id=kb_id,
             project_id=project_id,
@@ -82,7 +87,18 @@ def import_one(
             chunks=chunks,
             stored_path=str(path.resolve()),
             chunking_strategy=chunking_strategy,
+            on_progress=on_progress,
         )
+        if on_progress is not None:
+            on_progress(
+                {
+                    "stage": "complete",
+                    "message": "索引完成",
+                    "completed": len(chunks),
+                    "total": len(chunks),
+                    "percent": 100,
+                }
+            )
     except HTTPException as exc:
         # 后缀受支持但解析失败(损坏的 PDF/Office 文档), 计为失败而非跳过。
         return "failed", str(exc.detail)
@@ -118,13 +134,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     imported = skipped = failed = 0
-    for path in files:
+    for file_index, path in enumerate(files, start=1):
+        print(f"[{file_index}/{len(files)}] {path.name} · 开始处理 (0%)")
+
+        def show_progress(event: store.IndexProgress, *, current: int = file_index, filename: str = path.name) -> None:
+            print(f"[{current}/{len(files)}] {filename} · {event['message']} {event['completed']}/{event['total']} ({event['percent']}%)")
+
         status, detail = import_one(
             path,
             kb_id=args.kb_id,
             project_id=resolved_project_id,
             access_scope=args.access_scope,
             chunking_strategy=args.chunking_strategy,
+            on_progress=show_progress,
         )
         if status == "imported":
             imported += 1

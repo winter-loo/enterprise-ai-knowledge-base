@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -176,6 +177,49 @@ def parse_document(filename: str, data: bytes) -> tuple[str, str, str | None, li
     return text, parser, None, []
 
 
+def _index_uploaded_data(
+    *,
+    data: bytes,
+    filename: str,
+    kb_id: str,
+    project_id: str,
+    access_scope: str,
+    chunking_strategy: str,
+    on_progress: store.ProgressCallback | None = None,
+) -> JsonObject:
+    def report(stage: str, message: str, completed: int, total: int, percent: int) -> None:
+        if on_progress is not None:
+            on_progress({"stage": stage, "message": message, "completed": completed, "total": total, "percent": percent})
+
+    report("parsing", "解析文档", 0, 1, 10)
+    text, parser, pdf_type, pages_needing_ocr = parse_document(filename, data)
+    chunks = chunk_document(text, chunking_strategy)
+    if not chunks:
+        raise HTTPException(422, "文件中没有可索引的文本")
+    report("chunking", "切分文档", len(chunks), len(chunks), 30)
+    document_id = uuid.uuid4().hex
+    stored_path = UPLOAD_DIR / f"{document_id}-{Path(filename).name}"
+    try:
+        _ = stored_path.write_bytes(data)
+        return store.insert_document(
+            kb_id=kb_id,
+            project_id=project_id,
+            document_id=document_id,
+            filename=filename,
+            access_scope=access_scope,
+            parser=parser,
+            pdf_type=pdf_type,
+            pages_needing_ocr=pages_needing_ocr,
+            chunks=chunks,
+            stored_path=str(stored_path),
+            chunking_strategy=chunking_strategy,
+            on_progress=on_progress,
+        )
+    except Exception:
+        stored_path.unlink(missing_ok=True)
+        raise
+
+
 def split_text(text: str, size: int = 700, overlap: int = 100) -> list[str]:
     """Compatibility wrapper for the previous public helper; recursive is the new default."""
     return chunk_text(text, strategy="recursive", size=size, overlap=overlap)
@@ -348,44 +392,58 @@ async def upload_document(
     project_id: Annotated[str, Form()] = "default",
     access_scope: Annotated[str, Form()] = "general",
     chunking_strategy: Annotated[Literal["fixed", "recursive", "semantic", "paragraph"], Form()] = "recursive",
-) -> JsonObject:
-    # Scope validation performs synchronous PostgreSQL calls; keep it off the
-    # event loop along with semantic chunking and document indexing.
+) -> StreamingResponse:
     project_id = await run_in_threadpool(resolve_project_id, kb_id, project_id)
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件不能超过 10MB")
     filename = file.filename or "document.txt"
-    text, parser, pdf_type, pages_needing_ocr = parse_document(filename, data)
-    # Semantic chunking embeds candidate boundaries synchronously; keep that
-    # work off the event loop just like the later indexing step.
-    chunks = await run_in_threadpool(chunk_document, text, chunking_strategy)
-    if not chunks:
-        raise HTTPException(422, "文件中没有可索引的文本")
-    document_id = uuid.uuid4().hex
-    stored_path = UPLOAD_DIR / f"{document_id}-{Path(filename).name}"
-    try:
-        _ = stored_path.write_bytes(data)
-        # Embedding, per-chunk summaries, and database writes are synchronous
-        # network/IO work. Run them in Starlette's worker pool so a large upload
-        # cannot block the FastAPI event loop and starve health/chat requests.
-        return await run_in_threadpool(
-            store.insert_document,
-            kb_id=kb_id,
-            project_id=project_id,
-            document_id=document_id,
-            filename=filename,
-            access_scope=access_scope,
-            parser=parser,
-            pdf_type=pdf_type,
-            pages_needing_ocr=pages_needing_ocr,
-            chunks=chunks,
-            stored_path=str(stored_path),
-            chunking_strategy=chunking_strategy,
-        )
-    except Exception:
-        stored_path.unlink(missing_ok=True)
-        raise
+
+    async def events() -> AsyncIterator[str]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[JsonObject | None] = asyncio.Queue()
+
+        def progress(event: store.IndexProgress) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, dict(event))
+
+        async def index() -> None:
+            try:
+                result = await run_in_threadpool(
+                    _index_uploaded_data,
+                    data=data,
+                    filename=filename,
+                    kb_id=kb_id,
+                    project_id=project_id,
+                    access_scope=access_scope,
+                    chunking_strategy=chunking_strategy,
+                    on_progress=progress,
+                )
+                chunk_count = cast(int, result["chunk_count"])
+                await queue.put(
+                    {
+                        "stage": "complete",
+                        "message": "索引完成",
+                        "completed": chunk_count,
+                        "total": chunk_count,
+                        "percent": 100,
+                        "result": result,
+                    }
+                )
+            except store.EmbeddingUnavailableError as exc:
+                await queue.put({"stage": "error", "message": str(exc), "status": 503, "percent": 0})
+            except HTTPException as exc:
+                await queue.put({"stage": "error", "message": str(exc.detail), "status": exc.status_code, "percent": 0})
+            except Exception:
+                await queue.put({"stage": "error", "message": "索引失败，请稍后重试", "status": 500, "percent": 0})
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(index())
+        while (event := await queue.get()) is not None:
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+        await task
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 @app.get("/api/documents")

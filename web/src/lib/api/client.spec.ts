@@ -168,3 +168,107 @@ describe('authorization scopes', () => {
 		);
 	});
 });
+
+describe('document upload progress', () => {
+	it('streams indexing progress and returns the completed result', async () => {
+		const body = [
+			JSON.stringify({
+				stage: 'parsing',
+				message: '解析文档',
+				completed: 0,
+				total: 1,
+				percent: 10
+			}),
+			JSON.stringify({
+				stage: 'embedding',
+				message: '生成向量',
+				completed: 1,
+				total: 2,
+				percent: 50
+			}),
+			JSON.stringify({
+				stage: 'complete',
+				message: '索引完成',
+				completed: 2,
+				total: 2,
+				percent: 100,
+				result: {
+					id: 'doc-1',
+					filename: 'guide.md',
+					project_id: 'p-1',
+					status: 'READY',
+					chunk_count: 2
+				}
+			})
+		].join('\n');
+		const fetch = vi
+			.fn<typeof globalThis.fetch>()
+			.mockResolvedValue(new Response(body, { status: 200 }));
+		const client = createRagClient({ fetch });
+		const progress: number[] = [];
+
+		const result = await client.uploadDocument(
+			new File(['content'], 'guide.md'),
+			{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+			{ onProgress: (event) => progress.push(event.percent) }
+		);
+
+		expect(progress).toEqual([10, 50, 100]);
+		expect(result).toMatchObject({ id: 'doc-1', chunk_count: 2 });
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/documents/upload',
+			expect.objectContaining({ method: 'POST' })
+		);
+	});
+
+	it('reports browser upload bytes before consuming indexing events', async () => {
+		const first = `${JSON.stringify({ stage: 'parsing', message: '解析文档', completed: 0, total: 1, percent: 10 })}\n`;
+		const complete = JSON.stringify({
+			stage: 'complete',
+			message: '索引完成',
+			completed: 1,
+			total: 1,
+			percent: 100,
+			result: {
+				id: 'doc-1',
+				filename: 'guide.md',
+				project_id: 'p-1',
+				status: 'READY',
+				chunk_count: 1
+			}
+		});
+		const fake = {
+			upload: {} as XMLHttpRequestUpload,
+			responseText: '',
+			status: 200,
+			statusText: 'OK',
+			onprogress: null as XMLHttpRequest['onprogress'],
+			onload: null as XMLHttpRequest['onload'],
+			onerror: null as XMLHttpRequest['onerror'],
+			onabort: null as XMLHttpRequest['onabort'],
+			open: vi.fn(),
+			abort: vi.fn(),
+			send: vi.fn()
+		};
+		fake.send.mockImplementation(() => {
+			const uploadProgress = fake.upload.onprogress as ((event: ProgressEvent) => void) | null;
+			const downloadProgress = fake.onprogress as ((event: ProgressEvent) => void) | null;
+			const load = fake.onload as ((event: ProgressEvent) => void) | null;
+			uploadProgress?.({ lengthComputable: true, loaded: 50, total: 100 } as ProgressEvent);
+			fake.responseText = first;
+			downloadProgress?.({} as ProgressEvent);
+			fake.responseText += complete;
+			load?.({} as ProgressEvent);
+		});
+		const client = createRagClient({ xhr: () => fake as unknown as XMLHttpRequest });
+		const stages: string[] = [];
+
+		await client.uploadDocument(
+			new File(['content'], 'guide.md'),
+			{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+			{ onProgress: (event) => stages.push(`${event.stage}:${event.percent}`) }
+		);
+
+		expect(stages).toEqual(['uploading:5', 'parsing:10', 'complete:100']);
+	});
+});

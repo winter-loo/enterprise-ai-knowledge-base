@@ -63,6 +63,15 @@ qwen3-embedding:0.6b
 1024 dimensions
 ```
 
+索引会按批次调用 Embedding，并对超时、网络错误和服务端 5xx 做有限重试。可通过环境变量调整：
+
+```text
+EMBEDDING_BATCH_SIZE=16    # 每批片段数
+EMBEDDING_MAX_ATTEMPTS=3  # 每批最多尝试次数
+```
+
+重试耗尽时上传进度流发送状态为 503 的结构化错误事件；Web 将其转换为 `ApiError(503)`。同一 NDJSON 流展示解析、切片、向量、摘要和数据库写入的真实进度。
+
 文档入库使用 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL` 调用 OpenAI-compatible `/chat/completions`，为每个片段生成忠实摘要；未配置或单片摘要失败时，该片摘要留空且索引继续。问答生成复用相同配置，`LLM_MODEL` 默认为 `gpt-4o-mini`。
 
 ## 命令行批量导入
@@ -99,7 +108,7 @@ GET  /api/knowledge-bases
 POST /api/knowledge-bases
 GET  /api/projects?kb_id=company
 POST /api/projects
-POST /api/documents/upload
+POST /api/documents/upload       # NDJSON 索引进度流，最终事件携带导入结果
 GET  /api/documents?kb_id=company
 POST /api/retrieve              # 检索原语，返回完整 content 片段
 POST /api/ask                   # 有据回答原语；stream=true 时 SSE 返回 sources/delta/done/error

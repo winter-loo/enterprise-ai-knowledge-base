@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TypedDict, cast
 
@@ -38,6 +40,21 @@ class EmbeddingData(TypedDict):
 
 class EmbeddingResponse(TypedDict):
     data: list[EmbeddingData]
+
+
+class IndexProgress(TypedDict):
+    stage: str
+    message: str
+    completed: int
+    total: int
+    percent: int
+
+
+ProgressCallback = Callable[[IndexProgress], None]
+
+
+class EmbeddingUnavailableError(RuntimeError):
+    """Embedding 服务在有限重试后仍无法完成请求。"""
 
 
 def connect(scope_context: str = SCOPE_ALL) -> psycopg.Connection[DictRow]:
@@ -141,25 +158,61 @@ def create_project(kb_id: str, name: str, description: str) -> dict[str, str]:
     return {"id": project_id, "name": name}
 
 
-def embed(texts: list[str]) -> list[list[float]]:
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def embed(texts: list[str], on_progress: Callable[[int, int], None] | None = None) -> list[list[float]]:
     base_url = os.getenv("EMBEDDING_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
     api_key = os.getenv("EMBEDDING_API_KEY", "ollama")
     model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+    batch_size = _positive_int_env("EMBEDDING_BATCH_SIZE", 16)
+    max_attempts = _positive_int_env("EMBEDDING_MAX_ATTEMPTS", 3)
+    vectors: list[list[float]] = []
     with httpx.Client(timeout=120) as client:
-        response = client.post(f"{base_url}/embeddings", headers={"Authorization": f"Bearer {api_key}"}, json={"model": model, "input": texts})
-        _ = response.raise_for_status()
-        payload = cast(EmbeddingResponse, response.json())
-        vectors = [item["embedding"] for item in payload["data"]]
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+            batch_vectors: list[list[float]] | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = client.post(
+                        f"{base_url}/embeddings",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={"model": model, "input": batch},
+                    )
+                    _ = response.raise_for_status()
+                    payload = cast(EmbeddingResponse, response.json())
+                    batch_vectors = [item["embedding"] for item in payload["data"]]
+                    break
+                except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                        raise
+                    if attempt == max_attempts:
+                        raise EmbeddingUnavailableError("Embedding 服务暂时不可用，请稍后重试") from exc
+                    logger.warning("Embedding batch failed with %s (attempt %d/%d)", type(exc).__name__, attempt, max_attempts)
+                    time.sleep(2 ** (attempt - 1))
+            if batch_vectors is None:
+                raise EmbeddingUnavailableError("Embedding 服务暂时不可用，请稍后重试")
+            if len(batch_vectors) != len(batch) or any(len(vector) != EMBEDDING_DIMENSIONS for vector in batch_vectors):
+                raise RuntimeError(f"embedding service must return one {EMBEDDING_DIMENSIONS}-dimension vector per input")
+            vectors.extend(batch_vectors)
+            if on_progress is not None:
+                on_progress(len(vectors), len(texts))
     if len(vectors) != len(texts) or any(len(vector) != EMBEDDING_DIMENSIONS for vector in vectors):
         raise RuntimeError(f"embedding service must return one {EMBEDDING_DIMENSIONS}-dimension vector per input")
     return vectors
 
 
-def summarize_chunks(chunks: list[str]) -> list[str]:
+def summarize_chunks(chunks: list[str], on_progress: Callable[[int, int], None] | None = None) -> list[str]:
     base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
     api_key = os.getenv("LLM_API_KEY", "")
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
     if not base_url or not api_key:
+        if on_progress is not None:
+            on_progress(len(chunks), len(chunks))
         return ["" for _ in chunks]
 
     summaries: list[str] = []
@@ -182,6 +235,8 @@ def summarize_chunks(chunks: list[str]) -> list[str]:
                 except (httpx.HTTPError, TypeError, ValueError) as exc:
                     logger.warning("LLM summary failed for chunk %d: %s", index, type(exc).__name__)
                     summaries.append("")
+                if on_progress is not None:
+                    on_progress(index + 1, len(chunks))
     except Exception as exc:
         logger.warning("LLM summary client failed: %s", type(exc).__name__)
         summaries.extend("" for _ in chunks[len(summaries) :])
@@ -205,9 +260,21 @@ def insert_document(
     chunks: list[str],
     stored_path: str,
     chunking_strategy: str = "recursive",
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
-    vectors = embed(chunks)
-    summaries = summarize_chunks(chunks)
+    def report(stage: str, message: str, completed: int, total: int, percent: int) -> None:
+        if on_progress is not None:
+            on_progress({"stage": stage, "message": message, "completed": completed, "total": total, "percent": percent})
+
+    def embedding_progress(completed: int, total: int) -> None:
+        report("embedding", "生成向量", completed, total, 30 + round(40 * completed / total))
+
+    vectors = embed(chunks, on_progress=embedding_progress) if on_progress is not None else embed(chunks)
+
+    def summary_progress(completed: int, total: int) -> None:
+        report("summarizing", "生成摘要", completed, total, 70 + round(15 * completed / total))
+
+    summaries = summarize_chunks(chunks, on_progress=summary_progress) if on_progress is not None else summarize_chunks(chunks)
     created = now()
     with connect() as conn:
         for index, (content, vector, summary) in enumerate(zip(chunks, vectors, summaries, strict=True)):
@@ -233,6 +300,7 @@ def insert_document(
                     created,
                 ),
             )
+            report("storing", "写入索引", index + 1, len(chunks), 85 + round(14 * (index + 1) / len(chunks)))
         conn.commit()
     return {
         "id": document_id,

@@ -3,12 +3,24 @@ export type ChunkingStrategy = 'fixed' | 'recursive' | 'semantic' | 'paragraph';
 export interface ScopePayload {
 	kb_id: string;
 	project_id: string;
-	department: string;
+}
+
+/** RAG 服务的不透明访问范围：access_scope 由 authz 计算, 由调用方透传。 */
+export interface RagScope extends ScopePayload {
+	access_scope: string;
 }
 
 export interface HealthResponse {
 	status: string;
 	service: string;
+}
+
+export type VisibleScopeRequest = ScopePayload;
+
+export interface VisibleScopeResponse {
+	allowed: boolean;
+	project_id: string | null;
+	scope_context: string;
 }
 
 export interface KnowledgeBase {
@@ -55,7 +67,7 @@ export interface DocumentRecord {
 	id: string;
 	filename: string;
 	project_id: string;
-	department: string;
+	access_scope: string;
 	status: string;
 	chunk_count: number;
 	source_type: string;
@@ -77,11 +89,11 @@ export interface ImportResult {
 	pages_needing_ocr: number[];
 }
 
-export interface UploadDocumentRequest extends ScopePayload {
+export interface UploadDocumentRequest extends RagScope {
 	chunking_strategy?: ChunkingStrategy;
 }
 
-export interface DocumentImportRequest extends ScopePayload {
+export interface DocumentImportRequest extends RagScope {
 	title: string;
 	content: string;
 	chunking_strategy?: ChunkingStrategy;
@@ -94,7 +106,7 @@ export interface ChatPromptMessage {
 	content: string;
 }
 
-export interface AskRequest extends ScopePayload {
+export interface AskRequest extends RagScope {
 	question: string;
 	top_k?: number;
 	history?: ChatPromptMessage[];
@@ -125,7 +137,7 @@ export interface RetrieveChunk {
 	summary: string;
 }
 
-export interface RetrieveRequest extends ScopePayload {
+export interface RetrieveRequest extends RagScope {
 	question: string;
 	top_k?: number;
 }
@@ -141,7 +153,7 @@ export interface EvidenceDetail {
 	chunk_index: number;
 	content: string;
 	summary: string;
-	department: string;
+	access_scope: string;
 	project_id: string;
 	document_id: string;
 	source_type: string;
@@ -154,6 +166,7 @@ export interface EvidenceDetail {
 export interface ChatCompletionRequest extends ScopePayload {
 	session_id: string;
 	question: string;
+	department: string;
 	top_k?: number;
 }
 

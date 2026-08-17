@@ -1,7 +1,7 @@
 export type ChatScope = {
 	kbId: string;
 	projectId: string;
-	department: string;
+	accessScope: string;
 };
 
 /**
@@ -17,6 +17,6 @@ export function shouldStartNewSession(previous: ChatScope, next: ChatScope): boo
 	return (
 		previous.kbId !== next.kbId ||
 		previous.projectId !== next.projectId ||
-		previous.department !== next.department
+		previous.accessScope !== next.accessScope
 	);
 }

@@ -6,6 +6,7 @@ import type { ChatSource, ChatStreamEvent, ScopePayload } from '../api/types';
 export interface PythonChatBody extends ScopePayload {
 	session_id: string;
 	session_token: string;
+	department: string;
 	top_k?: number;
 }
 

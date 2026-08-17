@@ -17,11 +17,13 @@ import type {
 	Project,
 	ProjectCreateRequest,
 	ProjectCreateResponse,
+	RagScope,
 	RetrieveRequest,
 	RetrieveResponse,
-	ScopePayload,
 	UploadDocumentRequest,
-	ValidationIssue
+	ValidationIssue,
+	VisibleScopeRequest,
+	VisibleScopeResponse
 } from './types';
 
 export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -35,7 +37,11 @@ export interface ApiRequestOptions {
 	signal?: AbortSignal;
 }
 
-export interface SessionAccess extends ScopePayload {
+/** 会话服务仍使用 department 作为会话范围字段(与 RAG 的 access_scope 分离)。 */
+export interface SessionAccess {
+	kb_id: string;
+	project_id: string;
+	department: string;
 	session_token: string;
 }
 
@@ -122,7 +128,12 @@ function scopeSearchParams(scope: SessionAccess): URLSearchParams {
 
 interface RequestTransport {
 	request<T>(path: string, init?: RequestInit): Promise<T>;
-	jsonRequest<T>(path: string, payload: object, requestOptions?: ApiRequestOptions): Promise<T>;
+	jsonRequest<T>(
+		path: string,
+		payload: object,
+		requestOptions?: ApiRequestOptions,
+		headers?: Record<string, string>
+	): Promise<T>;
 }
 
 function createTransport(options: ApiClientOptions): RequestTransport {
@@ -162,17 +173,22 @@ function createTransport(options: ApiClientOptions): RequestTransport {
 	function jsonRequest<T>(
 		path: string,
 		payload: object,
-		requestOptions?: ApiRequestOptions
+		requestOptions?: ApiRequestOptions,
+		headers?: Record<string, string>
 	): Promise<T> {
 		return request<T>(path, {
 			method: 'POST',
-			headers: { 'content-type': 'application/json' },
+			headers: { 'content-type': 'application/json', ...headers },
 			body: JSON.stringify(payload),
 			signal: requestOptions?.signal
 		});
 	}
 
 	return { request, jsonRequest };
+}
+
+function scopeHeader(accessScope: string): Record<string, string> {
+	return { 'x-scope-context': accessScope };
 }
 
 export interface RagApiClient {
@@ -201,7 +217,7 @@ export interface RagApiClient {
 	retrieve(payload: RetrieveRequest, options?: ApiRequestOptions): Promise<RetrieveResponse>;
 	getEvidence(
 		chunkId: string,
-		scope: ScopePayload,
+		scope: RagScope,
 		options?: ApiRequestOptions
 	): Promise<EvidenceDetail>;
 }
@@ -218,6 +234,21 @@ export interface SessionApiClient {
 		scope: SessionAccess,
 		options?: ApiRequestOptions
 	): Promise<ClearSessionResponse>;
+}
+
+export interface AuthzApiClient {
+	visibleScope(
+		payload: VisibleScopeRequest,
+		options?: ApiRequestOptions
+	): Promise<VisibleScopeResponse>;
+}
+
+export function createAuthzClient(options: ApiClientOptions = {}): AuthzApiClient {
+	const { jsonRequest } = createTransport(options);
+	return {
+		visibleScope: (payload, requestOptions) =>
+			jsonRequest('/api/v1/authz/visible-scope', payload, requestOptions)
+	};
 }
 
 export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
@@ -244,7 +275,7 @@ export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
 			form.set('file', file);
 			form.set('kb_id', payload.kb_id);
 			form.set('project_id', payload.project_id);
-			form.set('department', payload.department);
+			form.set('access_scope', payload.access_scope);
 			form.set('chunking_strategy', payload.chunking_strategy ?? 'recursive');
 			return request('/api/documents/upload', {
 				method: 'POST',
@@ -254,16 +285,24 @@ export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
 		},
 		importDocument: (payload, requestOptions) =>
 			jsonRequest('/api/v1/document/import', payload, requestOptions),
-		ask: (payload, requestOptions) => jsonRequest('/api/ask', payload, requestOptions),
-		retrieve: (payload, requestOptions) => jsonRequest('/api/retrieve', payload, requestOptions),
+		ask: (payload, requestOptions) => {
+			const { access_scope, ...body } = payload;
+			return jsonRequest('/api/ask', body, requestOptions, scopeHeader(access_scope));
+		},
+		retrieve: (payload, requestOptions) => {
+			const { access_scope, ...body } = payload;
+			return jsonRequest('/api/retrieve', body, requestOptions, scopeHeader(access_scope));
+		},
 		getEvidence: (chunkId, scope, requestOptions) =>
 			request(
 				`/api/evidence/${encodeURIComponent(chunkId)}?${new URLSearchParams({
 					kb_id: scope.kb_id,
-					project_id: scope.project_id,
-					department: scope.department
+					project_id: scope.project_id
 				})}`,
-				{ signal: requestOptions?.signal }
+				{
+					headers: scopeHeader(scope.access_scope),
+					signal: requestOptions?.signal
+				}
 			)
 	};
 }
@@ -289,5 +328,6 @@ export function createSessionClient(options: ApiClientOptions = {}): SessionApiC
 
 export const rag = createRagClient();
 export const session = createSessionClient();
+export const authz = createAuthzClient();
 
 export type { ApiErrorResponse };

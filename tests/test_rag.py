@@ -1,4 +1,5 @@
 import json
+import os
 
 import httpx
 import pytest
@@ -8,8 +9,12 @@ from rag import store
 from rag.chunking import _token_count
 from rag.main import AskRequest, app, ask_stream, build_prompt, llm_answer, split_text, stream_content
 from shared.openai_responses import response_answer_text
+from shared.scope_token import sign_scope
+
+os.environ.setdefault("AUTHZ_SIGNING_KEY", "test-signing-key-with-at-least-32-bytes")
 
 SOURCES = [{"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "score": 0.9, "content": "重启服务前先保存配置。", "summary": "重启前保存配置"}]
+SCOPE_TOKEN = sign_scope("company", "p-1", "*")
 
 
 @pytest.fixture
@@ -31,7 +36,7 @@ def client(monkeypatch):
                 "id": "doc-1",
                 "filename": "guide.md",
                 "project_id": "p-1",
-                "department": "engineering",
+                "access_scope": "engineering",
                 "status": "READY",
                 "chunk_count": 1,
                 "source_type": "upload",
@@ -53,8 +58,8 @@ def client(monkeypatch):
             "pages_needing_ocr": [],
         },
     )
-    monkeypatch.setattr(store, "search", lambda question, kb_id, project_id, department, top_k: SOURCES)
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+    monkeypatch.setattr(store, "search", lambda question, kb_id, project_id, scope_context, top_k: SOURCES)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"x-scope-context": SCOPE_TOKEN})
 
 
 def test_split_text_overlaps_chunks():
@@ -82,7 +87,7 @@ async def test_scope_lists_and_upload(client, monkeypatch):
         response = await http.post(
             "/api/documents/upload",
             files={"file": ("guide.md", b"x", "text/markdown")},
-            data={"kb_id": "company", "project_id": "p-1", "department": "engineering", "chunking_strategy": "fixed"},
+            data={"kb_id": "company", "project_id": "p-1", "access_scope": "engineering", "chunking_strategy": "fixed"},
         )
     assert response.status_code == 200
     assert response.json()["project_id"] == "p-1"
@@ -129,7 +134,7 @@ async def test_project_scope_is_required(client):
 @pytest.mark.anyio
 async def test_retrieve_returns_full_chunks(client):
     async with client as http:
-        response = await http.post("/api/retrieve", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        response = await http.post("/api/retrieve", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"})
     body = response.json()
     assert response.status_code == 200
     assert body["retrieved"] == 1
@@ -141,7 +146,8 @@ async def test_retrieve_returns_full_chunks(client):
 async def test_document_import(client):
     async with client as http:
         imported = await http.post(
-            "/api/v1/document/import", json={"title": "guide.md", "content": "部署步骤。", "kb_id": "company", "project_id": "p-1", "department": "engineering"}
+            "/api/v1/document/import",
+            json={"title": "guide.md", "content": "部署步骤。", "kb_id": "company", "project_id": "p-1", "access_scope": "engineering"},
         )
     assert imported.status_code == 200
     assert imported.json()["status"] == "READY"
@@ -150,15 +156,15 @@ async def test_document_import(client):
 @pytest.mark.anyio
 async def test_scope_resolve_returns_canonical_project(client):
     async with client as http:
-        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "p-1"})
     assert response.status_code == 200
-    assert response.json() == {"kb_id": "company", "project_id": "p-1", "department": "engineering"}
+    assert response.json() == {"kb_id": "company", "project_id": "p-1"}
 
 
 @pytest.mark.anyio
 async def test_scope_resolve_rejects_unknown_project(client):
     async with client as http:
-        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "other", "department": "engineering"})
+        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "other"})
     assert response.status_code == 404
 
 
@@ -167,13 +173,13 @@ async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
     monkeypatch.setattr(
         store,
         "get_evidence",
-        lambda chunk_id, kb_id, project_id, department: {
+        lambda chunk_id, kb_id, project_id, scope_context: {
             "id": chunk_id,
             "filename": "guide.md",
             "chunk_index": 0,
             "content": "完整内容",
             "summary": "摘要",
-            "department": "engineering",
+            "access_scope": "engineering",
             "project_id": "p-1",
             "document_id": "doc-1",
             "source_type": "upload",
@@ -187,7 +193,7 @@ async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
     async with client as http:
         response = await http.get(
             "/api/evidence/chunk-1",
-            params={"kb_id": "company", "project_id": "p-1", "department": "engineering"},
+            params={"kb_id": "company", "project_id": "p-1"},
         )
 
     assert response.status_code == 200
@@ -197,12 +203,12 @@ async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
 
 @pytest.mark.anyio
 async def test_evidence_returns_404_for_unknown_chunk(client, monkeypatch):
-    monkeypatch.setattr(store, "get_evidence", lambda chunk_id, kb_id, project_id, department: None)
+    monkeypatch.setattr(store, "get_evidence", lambda chunk_id, kb_id, project_id, scope_context: None)
 
     async with client as http:
         response = await http.get(
             "/api/evidence/missing",
-            params={"kb_id": "company", "project_id": "p-1", "department": "engineering"},
+            params={"kb_id": "company", "project_id": "p-1"},
         )
 
     assert response.status_code == 404
@@ -215,7 +221,7 @@ async def test_ask_keeps_scope_and_citations(client, monkeypatch):
 
     monkeypatch.setattr("rag.main.llm_answer", answer)
     async with client as http:
-        response = await http.post("/api/ask", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        response = await http.post("/api/ask", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"})
     body = response.json()
     assert response.status_code == 200
     assert body["citations"][0]["filename"] == "guide.md"
@@ -238,17 +244,20 @@ async def test_ask_returns_only_cited_chunks(client, monkeypatch):
     monkeypatch.setattr("rag.main.llm_answer", answer)
 
     async with client as http:
-        response = await http.post("/api/ask", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1", "department": "engineering"})
+        response = await http.post("/api/ask", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"})
 
     body = response.json()
     assert [citation["citation_index"] for citation in body["citations"]] == [1, 3]
     assert body["retrieved"] == 3
 
 
-def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
+def test_search_adds_qwen_instruction_and_no_permission_predicate(monkeypatch):
     embedded = []
 
     class Connection:
+        def __init__(self, scope_context="*"):
+            self.scope_context = scope_context
+
         def __enter__(self):
             return self
 
@@ -258,8 +267,10 @@ def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
         def execute(self, query, params):
             _ = _split_query(query.encode("utf-8"))
             assert "e.kb_id=%s AND e.project_id=%s" in query
-            assert "e.department=%s OR e.department='general'" in query
-            assert params[1:] == ("年假审批需要哪些材料？", "company", "p-1", "hr", 5)
+            # RAG 的检索 SQL 不含任何权限谓词或 access_scope 列;行级可见性由 authz 的 RLS 强制。
+            assert "department" not in query
+            assert "access_scope" not in query
+            assert params[1:] == ("年假审批需要哪些材料？", "company", "p-1", 5)
             return self
 
         def fetchall(self):
@@ -267,7 +278,7 @@ def test_search_adds_qwen_instruction_and_permission_filters(monkeypatch):
 
     monkeypatch.setattr(store, "embed", lambda texts: embedded.extend(texts) or [[0.0] * 1024])
     monkeypatch.setattr(store, "connect", Connection)
-    store.search("年假审批需要哪些材料？", "company", "p-1", "hr", 5)
+    store.search("年假审批需要哪些材料？", "company", "p-1", "*", 5)
     assert embedded == [f"Instruct: {store.QUERY_INSTRUCTION}\nQuery: 年假审批需要哪些材料？"]
 
 
@@ -297,7 +308,7 @@ def test_insert_document_persists_llm_summaries(monkeypatch):
         project_id="p-1",
         document_id="doc-1",
         filename="guide.md",
-        department="engineering",
+        access_scope="engineering",
         parser="plain-text",
         pdf_type=None,
         pages_needing_ocr=[],
@@ -383,7 +394,7 @@ def test_insert_document_continues_when_summary_client_fails(monkeypatch):
         project_id="p-1",
         document_id="doc-1",
         filename="guide.md",
-        department="engineering",
+        access_scope="engineering",
         parser="plain-text",
         pdf_type=None,
         pages_needing_ocr=[],
@@ -491,7 +502,7 @@ async def test_ask_stream_accepts_responses_api_completion_event(monkeypatch):
             return super().stream(method, url, **kwargs)
 
     monkeypatch.setattr("rag.main.httpx.AsyncClient", lambda **kwargs: CaptureClient(lines, **kwargs))
-    payload = AskRequest(question="继续", kb_id="company", project_id="p-1", department="engineering")
+    payload = AskRequest(question="继续", kb_id="company", project_id="p-1")
 
     events = [event async for event in ask_stream(payload, SOURCES)]
 
@@ -504,7 +515,7 @@ async def test_ask_stream_accepts_responses_api_completion_event(monkeypatch):
 async def test_ask_stream_emits_cited_sources_after_answer(monkeypatch):
     monkeypatch.delenv("LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
-    payload = AskRequest(question="如何重启？", kb_id="company", project_id="p-1", department="engineering")
+    payload = AskRequest(question="如何重启？", kb_id="company", project_id="p-1")
 
     events = [event async for event in ask_stream(payload, SOURCES)]
 
@@ -542,8 +553,92 @@ async def test_ask_stream_rejects_truncated_or_malformed_upstream(monkeypatch, l
     monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
     monkeypatch.setenv("LLM_API_KEY", "secret")
     monkeypatch.setattr("rag.main.httpx.AsyncClient", lambda **kwargs: _FakeAsyncClient(lines, **kwargs))
-    payload = AskRequest(question="继续", kb_id="company", project_id="p-1", department="engineering")
+    payload = AskRequest(question="继续", kb_id="company", project_id="p-1")
 
     events = [event async for event in ask_stream(payload, SOURCES)]
 
     assert f'"message": "{message}"' in events[-1]
+
+
+# --- RLS 接缝:签名 x-scope-context capability 验证(ADR 0004 D5) ---
+# RAG 不计算授权,只验证 authz 签名并把 capability 内的范围交给 RLS。
+
+
+@pytest.mark.anyio
+async def test_retrieve_passes_scope_context_through(client, monkeypatch):
+    captured = {}
+
+    def fake_search(question, kb_id, project_id, scope_context, top_k):
+        captured.update(question=question, kb_id=kb_id, project_id=project_id, scope_context=scope_context, top_k=top_k)
+        return SOURCES
+
+    monkeypatch.setattr(store, "search", fake_search)
+
+    async with client as http:
+        response = await http.post(
+            "/api/retrieve",
+            json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"},
+            headers={"x-scope-context": sign_scope("company", "p-1", "eng,general")},
+        )
+
+    assert response.status_code == 200
+    assert captured["project_id"] == "p-1"
+    assert captured["scope_context"] == "eng,general"
+
+
+@pytest.mark.anyio
+async def test_retrieve_rejects_missing_scope_capability(client):
+    async with client as http:
+        response = await http.post(
+            "/api/retrieve",
+            json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"},
+            headers={"x-scope-context": ""},
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_evidence_passes_scope_context_through(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        store,
+        "get_evidence",
+        lambda chunk_id, kb_id, project_id, scope_context: captured.update(project_id=project_id, scope_context=scope_context) or None,
+    )
+
+    async with client as http:
+        response = await http.get(
+            "/api/evidence/chunk-1",
+            params={"kb_id": "company", "project_id": "p-1"},
+            headers={"x-scope-context": sign_scope("company", "p-1", "general")},
+        )
+
+    assert response.status_code == 404  # fake 返回 None,但 scope_context 已透传
+    assert captured["project_id"] == "p-1"
+    assert captured["scope_context"] == "general"
+
+
+def test_connect_sets_opaque_scope_context(monkeypatch):
+    executed = []
+    monkeypatch.setenv("DATABASE_URL", "postgresql:///fake")
+
+    class FakeConn:
+        def execute(self, query, params):
+            executed.append((query, params))
+            return self
+
+    class FakeConnection:
+        def __class_getitem__(cls, item):
+            return cls
+
+        @classmethod
+        def connect(cls, url, row_factory):
+            return FakeConn()
+
+    monkeypatch.setattr(store.psycopg, "Connection", FakeConnection)
+    connection = store.connect("eng,general")
+
+    assert isinstance(connection, FakeConn)
+    assert executed[0][0] == f"SELECT set_config('{store.SCOPE_SETTING}', %s, true)"
+    assert executed[0][1] == ("eng,general",)

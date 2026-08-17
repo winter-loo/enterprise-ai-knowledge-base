@@ -11,7 +11,7 @@
 	import SearchIcon from '@lucide/svelte/icons/search';
 	import SparklesIcon from '@lucide/svelte/icons/sparkles';
 	import type { DocumentRecord, KnowledgeBase, Project } from '$lib/api/types';
-	import { rag, session as sessionApi } from '$lib/api/client';
+	import { authz, rag, session as sessionApi } from '$lib/api/client';
 	import { PythonSseChatTransport, type PythonChatMessage } from '$lib/ai/python-sse-transport';
 	import {
 		createLocalSession,
@@ -38,7 +38,7 @@
 	import SessionSidebar from '$lib/components/SessionSidebar.svelte';
 
 	const transport = new PythonSseChatTransport();
-	const emptyScope: ChatScope = { kbId: '', projectId: '', department: 'general' };
+	const emptyScope: ChatScope = { kbId: '', projectId: '', accessScope: '' };
 	const placeholderSession: LocalChatSession = {
 		id: 'initial',
 		token: '',
@@ -55,7 +55,7 @@
 	let activeSession = $state<LocalChatSession>(placeholderSession);
 	let kbId = $state('');
 	let projectId = $state('');
-	let department = $state('general');
+	let accessScope = $state('');
 	let input = $state('');
 	let topK = $state(5);
 	let ready = $state(false);
@@ -73,17 +73,13 @@
 	let scopeController: AbortController | undefined;
 	let incompleteMessageIds = $state<string[]>([]);
 
-	let scope: ChatScope = $derived({ kbId, projectId, department });
+	let scope: ChatScope = $derived({ kbId, projectId, accessScope });
 	let quickSearchHistory = $derived(uiMessagesToPromptHistory(chat.messages));
 	let isGenerating = $derived(chat.status === 'submitted' || chat.status === 'streaming');
 	let activeKnowledgeBase = $derived(knowledgeBases.find((item) => item.id === kbId));
 	let activeProject = $derived(projects.find((item) => item.id === projectId));
 	let visibleDocumentCount = $derived(
-		documents.filter(
-			(document) =>
-				document.project_id === projectId &&
-				(document.department === department || document.department === 'general')
-		).length
+		documents.filter((document) => document.project_id === projectId).length
 	);
 
 	const prompts = [
@@ -120,7 +116,8 @@
 		return {
 			kb_id: value.kbId,
 			project_id: value.projectId,
-			department: value.department,
+			// 会话服务仍以 department 作为会话范围字段名。
+			department: value.accessScope,
 			session_token: sessionToken
 		};
 	}
@@ -161,6 +158,25 @@
 
 	function isAbortError(error: unknown): boolean {
 		return error instanceof Error && error.name === 'AbortError';
+	}
+
+	async function resolveAuthorizedScope(
+		nextKbId: string,
+		nextProjectId: string,
+		signal?: AbortSignal
+	): Promise<ChatScope> {
+		const resolved = await authz.visibleScope(
+			{ kb_id: nextKbId, project_id: nextProjectId },
+			{ signal }
+		);
+		if (!resolved.allowed || !resolved.project_id || !resolved.scope_context) {
+			throw new Error('当前用户无权访问该项目');
+		}
+		return {
+			kbId: nextKbId,
+			projectId: resolved.project_id,
+			accessScope: resolved.scope_context
+		};
 	}
 
 	function newSession(nextScope: ChatScope = scope): boolean {
@@ -209,13 +225,7 @@
 				? remembered!.scope.projectId
 				: (nextProjects[0]?.id ?? '');
 			if (!nextProjectId) throw new Error('服务端没有可用的项目范围');
-			const nextDepartment = remembered?.scope.department || 'general';
-
-			const resolvedScope = {
-				kbId: nextKbId,
-				projectId: nextProjectId,
-				department: nextDepartment
-			};
+			const resolvedScope = await resolveAuthorizedScope(nextKbId, nextProjectId);
 			let restoredMessages: PythonChatMessage[] | undefined;
 			if (remembered && !shouldStartNewSession(remembered.scope, resolvedScope)) {
 				try {
@@ -234,8 +244,8 @@
 			documents = nextDocuments;
 			sessions = nextSessions;
 			kbId = nextKbId;
-			projectId = nextProjectId;
-			department = nextDepartment;
+			projectId = resolvedScope.projectId;
+			accessScope = resolvedScope.accessScope;
 			if (remembered && restoredMessages) setActiveSession(remembered, restoredMessages);
 			else if (!newSession(resolvedScope)) throw new Error('无法持久化安全会话，工作台未启用');
 			serviceState = health.status === 'ok' && sessionHealth.status === 'ok' ? 'online' : 'offline';
@@ -296,10 +306,12 @@
 			if (request.id !== scopeRequestId) return;
 			const nextProjectId = nextProjects[0]?.id ?? '';
 			if (!nextProjectId) throw new Error('该知识库没有可用项目');
-			if (!newSession({ kbId: value, projectId: nextProjectId, department })) return;
+			const nextScope = await resolveAuthorizedScope(value, nextProjectId, request.signal);
+			if (!newSession(nextScope)) return;
 			kbId = value;
 			projects = nextProjects;
-			projectId = nextProjectId;
+			projectId = nextScope.projectId;
+			accessScope = nextScope.accessScope;
 			documents = nextDocuments;
 		} catch (error) {
 			if (request.id === scopeRequestId && !isAbortError(error)) {
@@ -310,16 +322,21 @@
 		}
 	}
 
-	function changeProject(value: string): void {
+	async function changeProject(value: string): Promise<void> {
 		if (!value || value === activeSession.scope.projectId) return;
-		if (!newSession({ kbId, projectId: value, department })) return;
-		projectId = value;
-	}
-
-	function changeDepartment(value: string): void {
-		if (!value || value === activeSession.scope.department) return;
-		if (!newSession({ kbId, projectId, department: value })) return;
-		department = value;
+		const request = beginScopeRequest();
+		try {
+			const nextScope = await resolveAuthorizedScope(kbId, value, request.signal);
+			if (request.id !== scopeRequestId || !newSession(nextScope)) return;
+			projectId = nextScope.projectId;
+			accessScope = nextScope.accessScope;
+		} catch (error) {
+			if (request.id === scopeRequestId && !isAbortError(error)) {
+				toast.error(error instanceof Error ? error.message : '无法切换项目');
+			}
+		} finally {
+			finishScopeRequest(request.id);
+		}
 	}
 
 	async function openSession(session: LocalChatSession): Promise<void> {
@@ -330,34 +347,34 @@
 		if (isGenerating) await chat.stop();
 		const request = beginScopeRequest();
 		try {
-			const [nextProjects, nextDocuments, history] = await Promise.all([
+			const [nextProjects, nextDocuments] = await Promise.all([
 				rag.listProjects(session.scope.kbId, { signal: request.signal }),
-				rag.listDocuments(session.scope.kbId, { signal: request.signal }),
-				sessionApi.getHistory(session.id, apiScope(session.scope, session.token), {
-					signal: request.signal
-				})
+				rag.listDocuments(session.scope.kbId, { signal: request.signal })
 			]);
 			if (request.id !== scopeRequestId) return;
 			const nextProjectId = nextProjects.some((project) => project.id === session.scope.projectId)
 				? session.scope.projectId
 				: (nextProjects[0]?.id ?? '');
 			if (!nextProjectId) throw new Error('该知识库没有可用项目');
-			if (nextProjectId !== session.scope.projectId) {
-				if (
-					!newSession({
-						kbId: session.scope.kbId,
-						projectId: nextProjectId,
-						department: session.scope.department
-					})
-				)
-					return;
-				toast.info('原项目已不可用，已为当前范围新建会话');
+			const nextScope = await resolveAuthorizedScope(
+				session.scope.kbId,
+				nextProjectId,
+				request.signal
+			);
+			if (shouldStartNewSession(session.scope, nextScope)) {
+				if (!newSession(nextScope)) return;
+				toast.info('项目或权限范围已变化，已新建安全会话');
 			} else {
+				const history = await sessionApi.getHistory(
+					session.id,
+					apiScope(nextScope, session.token),
+					{ signal: request.signal }
+				);
 				setActiveSession(session, historyToUIMessages(history.messages) as PythonChatMessage[]);
 			}
-			kbId = session.scope.kbId;
-			projectId = nextProjectId;
-			department = session.scope.department;
+			kbId = nextScope.kbId;
+			projectId = nextScope.projectId;
+			accessScope = nextScope.accessScope;
 			projects = nextProjects;
 			documents = nextDocuments;
 			mobileNavOpen = false;
@@ -430,7 +447,7 @@
 					session_token: activeSession.token,
 					kb_id: kbId,
 					project_id: projectId,
-					department,
+					department: accessScope,
 					top_k: topK
 				}
 			}
@@ -455,14 +472,10 @@
 		try {
 			if (createKind === 'knowledge-base') {
 				const created = await rag.createKnowledgeBase({ name, description });
-				createdScope = {
-					kbId: created.id,
-					projectId: created.default_project_id,
-					department
-				};
+				createdScope = await resolveAuthorizedScope(created.id, created.default_project_id);
 			} else {
 				const created = await rag.createProject({ kb_id: kbId, name, description });
-				createdScope = { kbId, projectId: created.id, department };
+				createdScope = await resolveAuthorizedScope(kbId, created.id);
 			}
 		} catch (error) {
 			toast.error(error instanceof Error ? error.message : '创建失败');
@@ -605,20 +618,6 @@
 			</div>
 		</header>
 
-		<ScopeBar
-			{knowledgeBases}
-			{projects}
-			{kbId}
-			{projectId}
-			{department}
-			disabled={!ready || loadingScope || isGenerating || createLoading}
-			onCreateKnowledgeBase={() => openCreate('knowledge-base')}
-			onCreateProject={() => openCreate('project')}
-			onKnowledgeBaseChange={(value) => void changeKnowledgeBase(value)}
-			onProjectChange={changeProject}
-			onDepartmentChange={changeDepartment}
-		/>
-
 		<section
 			bind:this={messagesViewport}
 			class="conversation-scroll min-h-0 flex-1 overflow-y-auto scroll-smooth"
@@ -722,6 +721,17 @@
 						disabled={!ready || serviceState !== 'online' || loadingScope}
 						placeholder="询问当前知识范围内的任何问题……"
 						class="max-h-40 min-h-12 border-0 px-3 py-2.5 text-[15px] leading-6 focus-visible:border-0"
+					/>
+					<ScopeBar
+						{knowledgeBases}
+						{projects}
+						{kbId}
+						{projectId}
+						disabled={!ready || loadingScope || isGenerating || createLoading}
+						onCreateKnowledgeBase={() => openCreate('knowledge-base')}
+						onCreateProject={() => openCreate('project')}
+						onKnowledgeBaseChange={(value) => void changeKnowledgeBase(value)}
+						onProjectChange={(value) => void changeProject(value)}
 					/>
 					<div class="flex items-center gap-1.5 px-1 pb-1">
 						<Button

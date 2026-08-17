@@ -28,6 +28,7 @@ class StaleGenerationConnection:
         normalized = " ".join(str(query).split())
         self.queries.append(normalized)
         if normalized.startswith("DELETE FROM chat_messages") and "make_interval" in normalized:
+            assert params is not None
             assert params[-1] == store.GENERATION_LEASE_SECONDS
             self.stale_pending = False
         if normalized.startswith("SELECT 1 FROM chat_messages") and "generation_complete=FALSE" in normalized:

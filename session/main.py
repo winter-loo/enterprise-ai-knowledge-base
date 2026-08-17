@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Annotated, cast
 
@@ -54,7 +54,7 @@ def canonical_project_id(kb_id: str, project_id: str, department: str) -> str:
     return cast(str, scope["project_id"])
 
 
-async def chat_stream(payload: ChatCompletion, summary: str, history: list[dict[str, str]], generation_id: str) -> AsyncIterator[str]:
+async def chat_stream(payload: ChatCompletion, summary: str, history: list[dict[str, str]], generation_id: str) -> AsyncGenerator[str, None]:
     # A generation is one persisted user turn plus its eventual assistant turn.
     # Retrieval and grounded generation are delegated to the RAG service; the
     # generation_id lets this completion step verify that the turn still exists

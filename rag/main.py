@@ -12,7 +12,7 @@ from typing import Annotated, Literal, cast
 import anydoc
 import httpx
 import pdf_inspector
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from psycopg.rows import DictRow
 from pydantic import BaseModel, Field
@@ -30,6 +30,7 @@ from shared.openai_responses import (
 from shared.openai_responses import (
     stream_delta as stream_content,
 )
+from shared.scope_token import verify_scope
 
 JsonObject = dict[str, object]
 
@@ -89,7 +90,6 @@ class RetrieveRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     kb_id: str = "company"
     project_id: str = "default"
-    department: str = "general"
     top_k: int = Field(default=5, ge=1, le=10)
 
 
@@ -97,7 +97,6 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     kb_id: str = "company"
     project_id: str = "default"
-    department: str = "general"
     top_k: int = Field(default=5, ge=1, le=10)
     history: list[dict[str, str]] = Field(default_factory=list)
     summary: str = ""
@@ -107,7 +106,6 @@ class AskRequest(BaseModel):
 class ScopeResolve(BaseModel):
     kb_id: str = "company"
     project_id: str = "default"
-    department: str = "general"
 
 
 class DocumentImport(BaseModel):
@@ -115,7 +113,7 @@ class DocumentImport(BaseModel):
     content: str = Field(min_length=1)
     kb_id: str = "company"
     project_id: str = "default"
-    department: str = "general"
+    access_scope: str = "general"
     chunking_strategy: Literal["fixed", "recursive", "semantic", "paragraph"] = "recursive"
 
 
@@ -137,6 +135,20 @@ def resolve_project_id(kb_id: str, project_id: str) -> str:
     """Validate a document scope in one synchronous worker-pool operation."""
     _ = ensure_kb(kb_id)
     return row_string(ensure_project(kb_id, project_id), "id")
+
+
+def resolve_and_search(question: str, kb_id: str, project_id: str, scope_context: str, top_k: int) -> list[DictRow]:
+    """Canonicalize the project and run retrieval in one synchronous worker-pool call.
+
+    scope_context 是 authz 签发的不透明 capability;RAG 只验证签名与目标绑定,
+    再把其中的可见范围交给 RLS,不重新计算权限。
+    """
+    resolved_project_id = resolve_project_id(kb_id, project_id)
+    try:
+        visible_scope = verify_scope(scope_context, kb_id, resolved_project_id)
+    except ValueError as exc:
+        raise HTTPException(401, "访问范围凭证无效或已过期") from exc
+    return store.search(question, kb_id, resolved_project_id, visible_scope, top_k)
 
 
 def extract_text(filename: str, data: bytes) -> str:
@@ -208,13 +220,6 @@ def cited_sources(answer: str, sources: list[DictRow]) -> list[dict[str, object]
     cited_indexes = [int(match.group(1)) - 1 for match in re.finditer(r"\[(\d+)\]", answer)]
     valid = sorted({index for index in cited_indexes if 0 <= index < len(sources)})
     return [citations[index] for index in valid]
-
-
-def resolve_and_search(question: str, kb_id: str, project_id: str, department: str, top_k: int) -> list[DictRow]:
-    """Resolve a scope and run retrieval in one synchronous worker-pool call."""
-    _ = ensure_kb(kb_id)
-    resolved_project_id = row_string(ensure_project(kb_id, project_id), "id")
-    return store.search(question, kb_id, resolved_project_id, department, top_k)
 
 
 def build_prompt(question: str, sources: list[DictRow], summary: str = "") -> str:
@@ -341,7 +346,7 @@ async def upload_document(
     file: Annotated[UploadFile, File()],
     kb_id: Annotated[str, Form()] = "company",
     project_id: Annotated[str, Form()] = "default",
-    department: Annotated[str, Form()] = "general",
+    access_scope: Annotated[str, Form()] = "general",
     chunking_strategy: Annotated[Literal["fixed", "recursive", "semantic", "paragraph"], Form()] = "recursive",
 ) -> JsonObject:
     # Scope validation performs synchronous PostgreSQL calls; keep it off the
@@ -370,7 +375,7 @@ async def upload_document(
             project_id=project_id,
             document_id=document_id,
             filename=filename,
-            department=department,
+            access_scope=access_scope,
             parser=parser,
             pdf_type=pdf_type,
             pages_needing_ocr=pages_needing_ocr,
@@ -390,20 +395,28 @@ def list_documents(kb_id: str = "company") -> list[JsonObject]:
 
 
 @app.get("/api/evidence/{chunk_id}")
-def get_evidence(chunk_id: str, kb_id: str, project_id: str, department: str) -> JsonObject:
-    # Enforce the same scope predicate as retrieval so a chunk id alone cannot
-    # read full content from another project or department.
-    _ = ensure_kb(kb_id)
-    resolved_project_id = row_string(ensure_project(kb_id, project_id), "id")
-    row = store.get_evidence(chunk_id, kb_id, resolved_project_id, department)
+def get_evidence(
+    chunk_id: str,
+    kb_id: str,
+    project_id: str,
+    x_scope_context: Annotated[str, Header()] = "",
+) -> JsonObject:
+    # 行级可见性由 authz 的 RLS 策略强制;这里只透传不透明 scope_context,
+    # 一个 chunk id 无法读到可见范围之外的内容。
+    resolved_project_id = resolve_project_id(kb_id, project_id)
+    try:
+        visible_scope = verify_scope(x_scope_context, kb_id, resolved_project_id)
+    except ValueError as exc:
+        raise HTTPException(401, "访问范围凭证无效或已过期") from exc
+    row = store.get_evidence(chunk_id, kb_id, resolved_project_id, visible_scope)
     if not row:
         raise HTTPException(404, "参考资料片段不存在")
     return dict(row)
 
 
 @app.post("/api/retrieve")
-def retrieve(payload: RetrieveRequest) -> JsonObject:
-    sources = resolve_and_search(payload.question, payload.kb_id, payload.project_id, payload.department, payload.top_k)
+def retrieve(payload: RetrieveRequest, x_scope_context: Annotated[str, Header()] = "") -> JsonObject:
+    sources = resolve_and_search(payload.question, payload.kb_id, payload.project_id, x_scope_context, payload.top_k)
     chunks = [
         {
             "id": source["id"],
@@ -420,16 +433,17 @@ def retrieve(payload: RetrieveRequest) -> JsonObject:
 
 @app.post("/api/scope/resolve")
 def resolve_scope(payload: ScopeResolve) -> dict[str, str]:
+    # 只做项目 id 规范化,不做授权;保持会话服务在 Phase 3 前不破坏。
     _ = ensure_kb(payload.kb_id)
     project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
-    return {"kb_id": payload.kb_id, "project_id": project_id, "department": payload.department}
+    return {"kb_id": payload.kb_id, "project_id": project_id}
 
 
 @app.post("/api/ask", response_model=None)
-async def ask(payload: AskRequest) -> JsonObject | StreamingResponse:
+async def ask(payload: AskRequest, x_scope_context: Annotated[str, Header()] = "") -> JsonObject | StreamingResponse:
     # Retrieval performs synchronous embedding and PostgreSQL calls; keep it off
     # the event loop so a slow search cannot starve concurrent answer streams.
-    sources = await run_in_threadpool(resolve_and_search, payload.question, payload.kb_id, payload.project_id, payload.department, payload.top_k)
+    sources = await run_in_threadpool(resolve_and_search, payload.question, payload.kb_id, payload.project_id, x_scope_context, payload.top_k)
     if payload.stream:
         return StreamingResponse(
             ask_stream(payload, sources),
@@ -459,7 +473,7 @@ async def import_document(payload: DocumentImport) -> JsonObject:
         project_id=project_id,
         document_id=uuid.uuid4().hex,
         filename=payload.title,
-        department=payload.department,
+        access_scope=payload.access_scope,
         parser="plain-text",
         pdf_type=None,
         pages_needing_ocr=[],

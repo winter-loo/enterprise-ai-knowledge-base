@@ -104,7 +104,7 @@ function parseResponseBody(text: string): unknown {
 	}
 }
 
-function errorMessage(body: unknown, response: Response): string {
+function errorMessage(body: unknown, response: { status: number; statusText: string }): string {
 	if (isDetailError(body)) return body.detail;
 	if (isValidationError(body)) return validationMessage(body);
 	if (typeof body === 'string' && body.trim()) return body.trim();
@@ -276,16 +276,18 @@ function uploadWithXhr(
 		};
 		xhr.onload = () => {
 			try {
-				consumeResponse(true);
 				if (xhr.status < 200 || xhr.status >= 300) {
+					const body = parseResponseBody(xhr.responseText);
 					fail(
-						new ApiError(xhr.statusText || '上传失败', {
+						new ApiError(errorMessage(body, xhr), {
 							status: xhr.status,
-							body: xhr.responseText
+							statusText: xhr.statusText,
+							body
 						})
 					);
 					return;
 				}
+				consumeResponse(true);
 				const result = progress.result();
 				if (!result) throw new ApiError('上传进度流未返回索引结果', { status: 502 });
 				settled = true;
@@ -297,7 +299,7 @@ function uploadWithXhr(
 		xhr.onerror = () => fail(new ApiError('Network request failed', { status: 0 }));
 		xhr.onabort = () => fail(new DOMException('The operation was aborted', 'AbortError'));
 		options?.signal?.addEventListener('abort', () => xhr.abort(), { once: true });
-		if (options?.signal?.aborted) xhr.abort();
+		if (options?.signal?.aborted) fail(new DOMException('The operation was aborted', 'AbortError'));
 		else xhr.send(form);
 	});
 }

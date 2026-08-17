@@ -271,4 +271,63 @@ describe('document upload progress', () => {
 
 		expect(stages).toEqual(['uploading:5', 'parsing:10', 'complete:100']);
 	});
+
+	it('preserves FastAPI details when upload is rejected before streaming', async () => {
+		const fake = {
+			upload: {} as XMLHttpRequestUpload,
+			responseText: JSON.stringify({ detail: '文件不能超过 10MB' }),
+			status: 413,
+			statusText: 'Content Too Large',
+			onprogress: null as XMLHttpRequest['onprogress'],
+			onload: null as XMLHttpRequest['onload'],
+			onerror: null as XMLHttpRequest['onerror'],
+			onabort: null as XMLHttpRequest['onabort'],
+			open: vi.fn(),
+			abort: vi.fn(),
+			send: vi.fn()
+		};
+		fake.send.mockImplementation(() => {
+			const load = fake.onload as ((event: ProgressEvent) => void) | null;
+			load?.({} as ProgressEvent);
+		});
+		const client = createRagClient({ xhr: () => fake as unknown as XMLHttpRequest });
+		const onProgress = vi.fn();
+
+		await expect(
+			client.uploadDocument(
+				new File(['content'], 'oversized.md'),
+				{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+				{ onProgress }
+			)
+		).rejects.toMatchObject({ status: 413, message: '文件不能超过 10MB' });
+		expect(onProgress).not.toHaveBeenCalled();
+	});
+
+	it('rejects immediately when the upload signal is already aborted', async () => {
+		const fake = {
+			upload: {} as XMLHttpRequestUpload,
+			responseText: '',
+			status: 0,
+			statusText: '',
+			onprogress: null as XMLHttpRequest['onprogress'],
+			onload: null as XMLHttpRequest['onload'],
+			onerror: null as XMLHttpRequest['onerror'],
+			onabort: null as XMLHttpRequest['onabort'],
+			open: vi.fn(),
+			abort: vi.fn(),
+			send: vi.fn()
+		};
+		const controller = new AbortController();
+		controller.abort();
+		const client = createRagClient({ xhr: () => fake as unknown as XMLHttpRequest });
+
+		await expect(
+			client.uploadDocument(
+				new File(['content'], 'guide.md'),
+				{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+				{ signal: controller.signal }
+			)
+		).rejects.toMatchObject({ name: 'AbortError' });
+		expect(fake.send).not.toHaveBeenCalled();
+	});
 });

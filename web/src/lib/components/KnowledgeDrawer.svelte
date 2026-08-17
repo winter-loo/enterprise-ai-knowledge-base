@@ -7,7 +7,12 @@
 	import FilePlus2Icon from '@lucide/svelte/icons/file-plus-2';
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import SearchIcon from '@lucide/svelte/icons/search';
-	import type { ChunkingStrategy, DocumentRecord, ImportResult } from '$lib/api/types';
+	import type {
+		ChunkingStrategy,
+		DocumentRecord,
+		ImportResult,
+		IndexProgressEvent
+	} from '$lib/api/types';
 	import { rag } from '$lib/api/client';
 	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { Badge } from '$lib/components/ui/badge';
@@ -37,6 +42,7 @@
 	let content = $state('');
 	let query = $state('');
 	let busy = $state(false);
+	let indexProgress = $state<IndexProgressEvent>();
 
 	const strategies: Array<{ value: ChunkingStrategy; label: string; help: string }> = [
 		{ value: 'recursive', label: '递归结构', help: '按段落、换行和标点保留自然结构' },
@@ -67,20 +73,34 @@
 		const file = fileList?.[0];
 		if (!file) return toast.error('请先选择一个文档');
 		busy = true;
+		indexProgress = {
+			stage: 'parsing',
+			message: '上传文件',
+			completed: 0,
+			total: 1,
+			percent: 0
+		};
 		let result: ImportResult;
 		try {
-			result = await rag.uploadDocument(file, {
-				kb_id: scope.kbId,
-				project_id: scope.projectId,
-				access_scope: 'general',
-				chunking_strategy: strategy
-			});
+			result = await rag.uploadDocument(
+				file,
+				{
+					kb_id: scope.kbId,
+					project_id: scope.projectId,
+					access_scope: 'general',
+					chunking_strategy: strategy
+				},
+				{
+					onProgress: (event) => (indexProgress = event)
+				}
+			);
 		} catch (error) {
 			toast.error(error instanceof Error ? error.message : '上传失败');
 			busy = false;
 			return;
 		}
 		fileList = undefined;
+		indexProgress = undefined;
 		toast.success(`已索引 ${result.chunk_count} 个知识片段`);
 		if (result.pages_needing_ocr.length) {
 			toast.warning(
@@ -255,6 +275,35 @@
 								accept=".pdf,.doc,.docx,.docm,.ppt,.pptx,.pptm,.xls,.xlsx,.xlsm,.xlsb,.odt,.ods,.odp,.rtf,.epub,.csv,.txt,.md,.json,.log,.html,.xml"
 							/>
 						</div>
+						{#if indexProgress}
+							<div
+								class="rounded-xl border border-[var(--line)] bg-white/55 p-4"
+								aria-live="polite"
+							>
+								<div class="flex items-center justify-between gap-3 text-xs">
+									<span class="font-semibold">{indexProgress.message}</span>
+									<span class="font-mono text-[var(--ink-muted)]">{indexProgress.percent}%</span>
+								</div>
+								<div
+									class="mt-3 h-2 overflow-hidden rounded-full bg-[var(--paper-deep)]"
+									role="progressbar"
+									aria-label="文档索引进度"
+									aria-valuemin="0"
+									aria-valuemax="100"
+									aria-valuenow={indexProgress.percent}
+								>
+									<div
+										class="h-full rounded-full bg-[var(--signal)] transition-[width] duration-300"
+										style:width={`${indexProgress.percent}%`}
+									></div>
+								</div>
+								{#if indexProgress.total && indexProgress.completed !== undefined}
+									<p class="mt-2 text-[10px] text-[var(--ink-faint)]">
+										{indexProgress.completed} / {indexProgress.total} 个片段
+									</p>
+								{/if}
+							</div>
+						{/if}
 						<Button onclick={upload} disabled={busy || !fileList?.length} class="rounded-lg">
 							{#if busy}<LoaderCircleIcon class="animate-spin" />{/if} 上传并索引
 						</Button>

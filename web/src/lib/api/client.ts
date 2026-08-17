@@ -11,6 +11,7 @@ import type {
 	FastApiValidationError,
 	HealthResponse,
 	ImportResult,
+	IndexProgressEvent,
 	KnowledgeBase,
 	KnowledgeBaseCreateRequest,
 	KnowledgeBaseCreateResponse,
@@ -31,10 +32,15 @@ export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promis
 export interface ApiClientOptions {
 	baseUrl?: string;
 	fetch?: FetchLike;
+	xhr?: () => XMLHttpRequest;
 }
 
 export interface ApiRequestOptions {
 	signal?: AbortSignal;
+}
+
+export interface UploadRequestOptions extends ApiRequestOptions {
+	onProgress?: (event: IndexProgressEvent) => void;
 }
 
 /** 会话服务仍使用 department 作为会话范围字段(与 RAG 的 access_scope 分离)。 */
@@ -98,7 +104,7 @@ function parseResponseBody(text: string): unknown {
 	}
 }
 
-function errorMessage(body: unknown, response: Response): string {
+function errorMessage(body: unknown, response: { status: number; statusText: string }): string {
 	if (isDetailError(body)) return body.detail;
 	if (isValidationError(body)) return validationMessage(body);
 	if (typeof body === 'string' && body.trim()) return body.trim();
@@ -127,6 +133,7 @@ function scopeSearchParams(scope: SessionAccess): URLSearchParams {
 }
 
 interface RequestTransport {
+	response(path: string, init?: RequestInit): Promise<Response>;
 	request<T>(path: string, init?: RequestInit): Promise<T>;
 	jsonRequest<T>(
 		path: string,
@@ -140,7 +147,7 @@ function createTransport(options: ApiClientOptions): RequestTransport {
 	const baseUrl = options.baseUrl ?? '';
 	const fetchResponse = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
 
-	async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+	async function response(path: string, init: RequestInit = {}): Promise<Response> {
 		let response: Response;
 		try {
 			response = await fetchResponse(joinUrl(baseUrl, path), init);
@@ -155,15 +162,20 @@ function createTransport(options: ApiClientOptions): RequestTransport {
 		}
 
 		if (!response.ok) throw await apiErrorFromResponse(response);
+		return response;
+	}
 
-		const text = await response.text();
+	async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+		const result = await response(path, init);
+
+		const text = await result.text();
 		if (!text) return undefined as T;
 
 		const body = parseResponseBody(text);
 		if (typeof body === 'string') {
 			throw new ApiError('Expected a JSON response from the API', {
-				status: response.status,
-				statusText: response.statusText,
+				status: result.status,
+				statusText: result.statusText,
 				body
 			});
 		}
@@ -184,11 +196,112 @@ function createTransport(options: ApiClientOptions): RequestTransport {
 		});
 	}
 
-	return { request, jsonRequest };
+	return { response, request, jsonRequest };
 }
 
 function scopeHeader(accessScope: string): Record<string, string> {
 	return { 'x-scope-context': accessScope };
+}
+
+function createProgressConsumer(options?: UploadRequestOptions): {
+	consume(line: string): void;
+	result(): ImportResult | undefined;
+} {
+	let completed: ImportResult | undefined;
+	return {
+		consume(line) {
+			if (!line.trim()) return;
+			const event = JSON.parse(line) as IndexProgressEvent;
+			options?.onProgress?.(event);
+			if (event.stage === 'error') {
+				throw new ApiError(event.message, { status: event.status ?? 500, body: event });
+			}
+			if (event.stage === 'complete') completed = event.result;
+		},
+		result: () => completed
+	};
+}
+
+function uploadWithXhr(
+	url: string,
+	form: FormData,
+	options: UploadRequestOptions | undefined,
+	createXhr: () => XMLHttpRequest
+): Promise<ImportResult> {
+	return new Promise((resolve, reject) => {
+		const xhr = createXhr();
+		const progress = createProgressConsumer(options);
+		let offset = 0;
+		let buffer = '';
+		let settled = false;
+
+		const fail = (error: unknown): void => {
+			if (settled) return;
+			settled = true;
+			reject(error);
+		};
+		const consumeResponse = (final: boolean): void => {
+			buffer += xhr.responseText.slice(offset);
+			offset = xhr.responseText.length;
+			const lines = buffer.split('\n');
+			buffer = lines.pop() ?? '';
+			for (const line of lines) progress.consume(line);
+			if (final) {
+				progress.consume(buffer);
+				buffer = '';
+			}
+		};
+
+		xhr.open('POST', url);
+		xhr.upload.onprogress = (event) => {
+			const percent =
+				event.lengthComputable && event.total > 0
+					? Math.min(10, Math.round((10 * event.loaded) / event.total))
+					: 0;
+			options?.onProgress?.({
+				stage: 'uploading',
+				message: '上传文件',
+				completed: event.loaded,
+				total: event.total,
+				percent
+			});
+		};
+		xhr.onprogress = () => {
+			try {
+				consumeResponse(false);
+			} catch (error) {
+				fail(error);
+				xhr.abort();
+			}
+		};
+		xhr.onload = () => {
+			try {
+				if (xhr.status < 200 || xhr.status >= 300) {
+					const body = parseResponseBody(xhr.responseText);
+					fail(
+						new ApiError(errorMessage(body, xhr), {
+							status: xhr.status,
+							statusText: xhr.statusText,
+							body
+						})
+					);
+					return;
+				}
+				consumeResponse(true);
+				const result = progress.result();
+				if (!result) throw new ApiError('上传进度流未返回索引结果', { status: 502 });
+				settled = true;
+				resolve(result);
+			} catch (error) {
+				fail(error);
+			}
+		};
+		xhr.onerror = () => fail(new ApiError('Network request failed', { status: 0 }));
+		xhr.onabort = () => fail(new DOMException('The operation was aborted', 'AbortError'));
+		options?.signal?.addEventListener('abort', () => xhr.abort(), { once: true });
+		if (options?.signal?.aborted) fail(new DOMException('The operation was aborted', 'AbortError'));
+		else xhr.send(form);
+	});
 }
 
 export interface RagApiClient {
@@ -207,7 +320,7 @@ export interface RagApiClient {
 	uploadDocument(
 		file: File,
 		payload: UploadDocumentRequest,
-		options?: ApiRequestOptions
+		options?: UploadRequestOptions
 	): Promise<ImportResult>;
 	importDocument(
 		payload: DocumentImportRequest,
@@ -252,7 +365,7 @@ export function createAuthzClient(options: ApiClientOptions = {}): AuthzApiClien
 }
 
 export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
-	const { request, jsonRequest } = createTransport(options);
+	const { response, request, jsonRequest } = createTransport(options);
 
 	return {
 		health: (requestOptions) => request('/api/health', { signal: requestOptions?.signal }),
@@ -270,18 +383,50 @@ export function createRagClient(options: ApiClientOptions = {}): RagApiClient {
 			request(`/api/documents?${new URLSearchParams({ kb_id: kbId })}`, {
 				signal: requestOptions?.signal
 			}),
-		uploadDocument: (file, payload, requestOptions) => {
+		uploadDocument: async (file, payload, requestOptions) => {
 			const form = new FormData();
 			form.set('file', file);
 			form.set('kb_id', payload.kb_id);
 			form.set('project_id', payload.project_id);
 			form.set('access_scope', payload.access_scope);
 			form.set('chunking_strategy', payload.chunking_strategy ?? 'recursive');
-			return request('/api/documents/upload', {
+			const uploadPath = '/api/documents/upload';
+			if (
+				options.xhr !== undefined ||
+				(options.fetch === undefined && typeof XMLHttpRequest !== 'undefined')
+			) {
+				return uploadWithXhr(
+					joinUrl(options.baseUrl ?? '', uploadPath),
+					form,
+					requestOptions,
+					options.xhr ?? (() => new XMLHttpRequest())
+				);
+			}
+			const uploadResponse = await response(uploadPath, {
 				method: 'POST',
 				body: form,
 				signal: requestOptions?.signal
 			});
+			if (!uploadResponse.body) {
+				throw new ApiError('上传响应缺少进度流', { status: uploadResponse.status });
+			}
+			const reader = uploadResponse.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+			const progress = createProgressConsumer(requestOptions);
+
+			while (true) {
+				const { done, value } = await reader.read();
+				buffer += decoder.decode(value, { stream: !done });
+				const lines = buffer.split('\n');
+				buffer = lines.pop() ?? '';
+				for (const line of lines) progress.consume(line);
+				if (done) break;
+			}
+			progress.consume(buffer);
+			const result = progress.result();
+			if (!result) throw new ApiError('上传进度流未返回索引结果', { status: 502 });
+			return result;
 		},
 		importDocument: (payload, requestOptions) =>
 			jsonRequest('/api/v1/document/import', payload, requestOptions),

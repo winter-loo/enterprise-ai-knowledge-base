@@ -89,6 +89,26 @@ export interface ImportResult {
 	pages_needing_ocr: number[];
 }
 
+export type IndexProgressStage =
+	| 'uploading'
+	| 'parsing'
+	| 'chunking'
+	| 'embedding'
+	| 'summarizing'
+	| 'storing'
+	| 'complete'
+	| 'error';
+
+export interface IndexProgressEvent {
+	stage: IndexProgressStage;
+	message: string;
+	completed?: number;
+	total?: number;
+	percent: number;
+	status?: number;
+	result?: ImportResult;
+}
+
 export interface UploadDocumentRequest extends RagScope {
 	chunking_strategy?: ChunkingStrategy;
 }

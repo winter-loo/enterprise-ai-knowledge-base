@@ -89,9 +89,10 @@ async def test_scope_lists_and_upload(client, monkeypatch):
             files={"file": ("guide.md", b"x", "text/markdown")},
             data={"kb_id": "company", "project_id": "p-1", "access_scope": "engineering", "chunking_strategy": "fixed"},
         )
+    events = [json.loads(line) for line in response.text.splitlines()]
     assert response.status_code == 200
-    assert response.json()["project_id"] == "p-1"
-    assert response.json()["chunking_strategy"] == "fixed"
+    assert events[-1]["result"]["project_id"] == "p-1"
+    assert events[-1]["result"]["chunking_strategy"] == "fixed"
 
 
 @pytest.mark.anyio
@@ -101,14 +102,71 @@ async def test_failed_upload_removes_stored_source(client, monkeypatch, tmp_path
     monkeypatch.setattr(store, "insert_document", lambda **_: (_ for _ in ()).throw(RuntimeError("embedding unavailable")))
 
     async with client as http:
-        with pytest.raises(RuntimeError, match="embedding unavailable"):
-            _ = await http.post(
-                "/api/documents/upload",
-                files={"file": ("confidential.md", b"secret", "text/markdown")},
-                data={"kb_id": "company", "project_id": "p-1"},
-            )
+        response = await http.post(
+            "/api/documents/upload",
+            files={"file": ("confidential.md", b"secret", "text/markdown")},
+            data={"kb_id": "company", "project_id": "p-1"},
+        )
 
+    assert json.loads(response.text.splitlines()[-1]) == {
+        "stage": "error",
+        "message": "索引失败，请稍后重试",
+        "status": 500,
+        "percent": 0,
+    }
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.anyio
+async def test_upload_maps_embedding_unavailable_to_503(client, monkeypatch, tmp_path):
+    monkeypatch.setattr("rag.main.UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr("rag.main.parse_document", lambda *_: ("部署步骤。", "plain-text", None, []))
+    monkeypatch.setattr(
+        store,
+        "insert_document",
+        lambda **_: (_ for _ in ()).throw(store.EmbeddingUnavailableError("Embedding 服务暂时不可用，请稍后重试")),
+    )
+
+    async with client as http:
+        response = await http.post(
+            "/api/documents/upload",
+            files={"file": ("guide.md", b"x", "text/markdown")},
+            data={"kb_id": "company", "project_id": "p-1"},
+        )
+
+    assert response.status_code == 200
+    assert json.loads(response.text.splitlines()[-1]) == {
+        "stage": "error",
+        "message": "Embedding 服务暂时不可用，请稍后重试",
+        "status": 503,
+        "percent": 0,
+    }
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.anyio
+async def test_upload_progress_streams_indexing_stages_and_result(client, monkeypatch, tmp_path):
+    monkeypatch.setattr("rag.main.UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr("rag.main.parse_document", lambda *_: ("部署步骤。", "plain-text", None, []))
+    monkeypatch.setattr("rag.main.chunk_document", lambda *_: ["片段一", "片段二"])
+
+    def insert(**kwargs):
+        kwargs["on_progress"]({"stage": "embedding", "message": "生成向量", "completed": 2, "total": 2, "percent": 70})
+        return {"id": kwargs["document_id"], "filename": kwargs["filename"], "project_id": "p-1", "status": "READY", "chunk_count": 2}
+
+    monkeypatch.setattr(store, "insert_document", insert)
+
+    async with client as http:
+        response = await http.post(
+            "/api/documents/upload",
+            files={"file": ("guide.md", b"x", "text/markdown")},
+            data={"kb_id": "company", "project_id": "p-1"},
+        )
+
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert response.status_code == 200
+    assert [event["stage"] for event in events] == ["parsing", "chunking", "embedding", "complete"]
+    assert events[-1]["result"]["chunk_count"] == 2
 
 
 @pytest.mark.anyio
@@ -317,6 +375,66 @@ def test_insert_document_persists_llm_summaries(monkeypatch):
     )
 
     assert inserted[0][6] == "部署前保存配置。"
+
+
+def test_embed_batches_requests_and_reports_completed_chunks(monkeypatch):
+    requests = []
+    real_client = httpx.Client
+
+    def handler(request):
+        body = json.loads(request.read())
+        requests.append(body["input"])
+        return httpx.Response(200, json={"data": [{"embedding": [0.0] * 1024} for _ in body["input"]]})
+
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embedding.test/v1")
+    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "2")
+    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
+    progress = []
+
+    vectors = store.embed(["一", "二", "三", "四", "五"], on_progress=lambda completed, total: progress.append((completed, total)))
+
+    assert requests == [["一", "二"], ["三", "四"], ["五"]]
+    assert len(vectors) == 5
+    assert progress == [(2, 5), (4, 5), (5, 5)]
+
+
+def test_embed_retries_transient_timeout_then_succeeds(monkeypatch):
+    attempts = 0
+    real_client = httpx.Client
+
+    def handler(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.ReadTimeout("cold model", request=request)
+        return httpx.Response(200, json={"data": [{"embedding": [0.0] * 1024}]})
+
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embedding.test/v1")
+    monkeypatch.setenv("EMBEDDING_MAX_ATTEMPTS", "3")
+    monkeypatch.setattr(store.time, "sleep", lambda _: None)
+    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    assert len(store.embed(["内容"])) == 1
+    assert attempts == 3
+
+
+def test_embed_raises_unavailable_after_finite_retries(monkeypatch):
+    attempts = 0
+    real_client = httpx.Client
+
+    def handler(request):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("still cold", request=request)
+
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embedding.test/v1")
+    monkeypatch.setenv("EMBEDDING_MAX_ATTEMPTS", "2")
+    monkeypatch.setattr(store.time, "sleep", lambda _: None)
+    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
+
+    with pytest.raises(store.EmbeddingUnavailableError, match="Embedding 服务暂时不可用"):
+        store.embed(["内容"])
+    assert attempts == 2
 
 
 def test_summarize_chunks_uses_configured_llm(monkeypatch):

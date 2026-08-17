@@ -168,3 +168,166 @@ describe('authorization scopes', () => {
 		);
 	});
 });
+
+describe('document upload progress', () => {
+	it('streams indexing progress and returns the completed result', async () => {
+		const body = [
+			JSON.stringify({
+				stage: 'parsing',
+				message: '解析文档',
+				completed: 0,
+				total: 1,
+				percent: 10
+			}),
+			JSON.stringify({
+				stage: 'embedding',
+				message: '生成向量',
+				completed: 1,
+				total: 2,
+				percent: 50
+			}),
+			JSON.stringify({
+				stage: 'complete',
+				message: '索引完成',
+				completed: 2,
+				total: 2,
+				percent: 100,
+				result: {
+					id: 'doc-1',
+					filename: 'guide.md',
+					project_id: 'p-1',
+					status: 'READY',
+					chunk_count: 2
+				}
+			})
+		].join('\n');
+		const fetch = vi
+			.fn<typeof globalThis.fetch>()
+			.mockResolvedValue(new Response(body, { status: 200 }));
+		const client = createRagClient({ fetch });
+		const progress: number[] = [];
+
+		const result = await client.uploadDocument(
+			new File(['content'], 'guide.md'),
+			{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+			{ onProgress: (event) => progress.push(event.percent) }
+		);
+
+		expect(progress).toEqual([10, 50, 100]);
+		expect(result).toMatchObject({ id: 'doc-1', chunk_count: 2 });
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/documents/upload',
+			expect.objectContaining({ method: 'POST' })
+		);
+	});
+
+	it('reports browser upload bytes before consuming indexing events', async () => {
+		const first = `${JSON.stringify({ stage: 'parsing', message: '解析文档', completed: 0, total: 1, percent: 10 })}\n`;
+		const complete = JSON.stringify({
+			stage: 'complete',
+			message: '索引完成',
+			completed: 1,
+			total: 1,
+			percent: 100,
+			result: {
+				id: 'doc-1',
+				filename: 'guide.md',
+				project_id: 'p-1',
+				status: 'READY',
+				chunk_count: 1
+			}
+		});
+		const fake = {
+			upload: {} as XMLHttpRequestUpload,
+			responseText: '',
+			status: 200,
+			statusText: 'OK',
+			onprogress: null as XMLHttpRequest['onprogress'],
+			onload: null as XMLHttpRequest['onload'],
+			onerror: null as XMLHttpRequest['onerror'],
+			onabort: null as XMLHttpRequest['onabort'],
+			open: vi.fn(),
+			abort: vi.fn(),
+			send: vi.fn()
+		};
+		fake.send.mockImplementation(() => {
+			const uploadProgress = fake.upload.onprogress as ((event: ProgressEvent) => void) | null;
+			const downloadProgress = fake.onprogress as ((event: ProgressEvent) => void) | null;
+			const load = fake.onload as ((event: ProgressEvent) => void) | null;
+			uploadProgress?.({ lengthComputable: true, loaded: 50, total: 100 } as ProgressEvent);
+			fake.responseText = first;
+			downloadProgress?.({} as ProgressEvent);
+			fake.responseText += complete;
+			load?.({} as ProgressEvent);
+		});
+		const client = createRagClient({ xhr: () => fake as unknown as XMLHttpRequest });
+		const stages: string[] = [];
+
+		await client.uploadDocument(
+			new File(['content'], 'guide.md'),
+			{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+			{ onProgress: (event) => stages.push(`${event.stage}:${event.percent}`) }
+		);
+
+		expect(stages).toEqual(['uploading:5', 'parsing:10', 'complete:100']);
+	});
+
+	it('preserves FastAPI details when upload is rejected before streaming', async () => {
+		const fake = {
+			upload: {} as XMLHttpRequestUpload,
+			responseText: JSON.stringify({ detail: '文件不能超过 10MB' }),
+			status: 413,
+			statusText: 'Content Too Large',
+			onprogress: null as XMLHttpRequest['onprogress'],
+			onload: null as XMLHttpRequest['onload'],
+			onerror: null as XMLHttpRequest['onerror'],
+			onabort: null as XMLHttpRequest['onabort'],
+			open: vi.fn(),
+			abort: vi.fn(),
+			send: vi.fn()
+		};
+		fake.send.mockImplementation(() => {
+			const load = fake.onload as ((event: ProgressEvent) => void) | null;
+			load?.({} as ProgressEvent);
+		});
+		const client = createRagClient({ xhr: () => fake as unknown as XMLHttpRequest });
+		const onProgress = vi.fn();
+
+		await expect(
+			client.uploadDocument(
+				new File(['content'], 'oversized.md'),
+				{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+				{ onProgress }
+			)
+		).rejects.toMatchObject({ status: 413, message: '文件不能超过 10MB' });
+		expect(onProgress).not.toHaveBeenCalled();
+	});
+
+	it('rejects immediately when the upload signal is already aborted', async () => {
+		const fake = {
+			upload: {} as XMLHttpRequestUpload,
+			responseText: '',
+			status: 0,
+			statusText: '',
+			onprogress: null as XMLHttpRequest['onprogress'],
+			onload: null as XMLHttpRequest['onload'],
+			onerror: null as XMLHttpRequest['onerror'],
+			onabort: null as XMLHttpRequest['onabort'],
+			open: vi.fn(),
+			abort: vi.fn(),
+			send: vi.fn()
+		};
+		const controller = new AbortController();
+		controller.abort();
+		const client = createRagClient({ xhr: () => fake as unknown as XMLHttpRequest });
+
+		await expect(
+			client.uploadDocument(
+				new File(['content'], 'guide.md'),
+				{ kb_id: 'company', project_id: 'p-1', access_scope: 'general' },
+				{ signal: controller.signal }
+			)
+		).rejects.toMatchObject({ name: 'AbortError' });
+		expect(fake.send).not.toHaveBeenCalled();
+	});
+});

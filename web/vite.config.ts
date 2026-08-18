@@ -22,14 +22,16 @@ export default defineConfig({
 		proxy: {
 			'/api/v1/authz': {
 				target: 'http://127.0.0.1:8012',
-				configure(proxy) {
-					proxy.on('proxyReq', (request) => {
-						request.setHeader('x-principal', process.env.AUTHZ_DEV_PRINCIPAL?.trim() || 'admin');
-					});
-				}
+				configure: injectDevelopmentPrincipal
 			},
-			'/api/v1/chat': 'http://127.0.0.1:8011',
-			'/api': 'http://127.0.0.1:8010'
+			'/api/v1/chat': {
+				target: 'http://127.0.0.1:8011',
+				configure: injectDevelopmentPrincipal
+			},
+			'/api': {
+				target: 'http://127.0.0.1:8010',
+				configure: injectDevelopmentPrincipal
+			}
 		}
 	},
 	test: {
@@ -39,3 +41,14 @@ export default defineConfig({
 		exclude: ['src/**/*.svelte.{test,spec}.{js,ts}']
 	}
 });
+
+function injectDevelopmentPrincipal(proxy: {
+	on(
+		event: 'proxyReq',
+		listener: (request: { setHeader(name: string, value: string): void }) => void
+	): void;
+}): void {
+	proxy.on('proxyReq', (request) => {
+		request.setHeader('x-principal', process.env.AUTHZ_DEV_PRINCIPAL?.trim() || 'admin');
+	});
+}

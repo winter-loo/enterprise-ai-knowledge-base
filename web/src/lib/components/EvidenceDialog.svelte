@@ -2,8 +2,7 @@
 	import FileTextIcon from '@lucide/svelte/icons/file-text';
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import { rag } from '$lib/api/client';
-	import type { ChatSource, EvidenceDetail } from '$lib/api/types';
-	import type { ChatScope } from '$lib/chat/scope-policy';
+	import type { ChatSource, EvidenceDetail, ProjectReference } from '$lib/api/types';
 	import { Badge } from '$lib/components/ui/badge';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import MarkdownText from './MarkdownText.svelte';
@@ -11,8 +10,8 @@
 	let {
 		open = $bindable(false),
 		source = null,
-		scope
-	}: { open: boolean; source: ChatSource | null; scope: ChatScope } = $props();
+		project
+	}: { open: boolean; source: ChatSource | null; project: ProjectReference } = $props();
 
 	let detail = $state<EvidenceDetail>();
 	let loading = $state(false);
@@ -27,9 +26,7 @@
 		loading = true;
 		rag
 			.getEvidence(chunkId, {
-				kb_id: scope.kbId,
-				project_id: scope.projectId,
-				access_scope: scope.accessScope
+				project_id: project.projectId
 			})
 			.then((next) => {
 				if (!cancelled) detail = next;
@@ -121,10 +118,6 @@
 						<div class="flex gap-3">
 							<dt class="w-24 shrink-0 text-[var(--ink-faint)]">文件</dt>
 							<dd class="min-w-0 break-all">{detail.filename}</dd>
-						</div>
-						<div class="flex gap-3">
-							<dt class="w-24 shrink-0 text-[var(--ink-faint)]">访问范围</dt>
-							<dd>{detail.access_scope}</dd>
 						</div>
 						{#if detail.page != null}
 							<div class="flex gap-3">

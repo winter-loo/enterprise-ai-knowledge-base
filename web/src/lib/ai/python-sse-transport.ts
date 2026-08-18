@@ -1,14 +1,9 @@
 import type { ChatTransport, UIMessage, UIMessageChunk } from 'ai';
 
 import { ApiError, apiErrorFromResponse } from '../api/client';
-import type { ChatSource, ChatStreamEvent, ScopePayload } from '../api/types';
+import type { ChatCompletionRequest, ChatSource, ChatStreamEvent } from '../api/types';
 
-export interface PythonChatBody extends ScopePayload {
-	session_id: string;
-	session_token: string;
-	department: string;
-	top_k?: number;
-}
+export type PythonChatBody = ChatCompletionRequest;
 
 export interface PythonChatData extends Record<string, unknown> {
 	sources: ChatSource[];
@@ -247,19 +242,12 @@ function lastUserQuestion(messages: UIMessage[]): string {
 	throw new Error('A non-empty user text message is required.');
 }
 
-function requireString(body: Record<string, unknown>, field: keyof PythonChatBody): string {
-	const value = body[field];
-	if (typeof value !== 'string' || !value.trim())
-		throw new Error(`Chat request body requires ${field}.`);
-	return value;
-}
-
 function pythonRequestBody(
 	body: object | undefined,
 	question: string,
 	chatId: string
 ): PythonChatBody & { question: string } {
-	if (!isRecord(body)) throw new Error('Chat request body requires session and scope fields.');
+	if (!isRecord(body)) throw new Error('Chat request body requires a session id.');
 
 	const topK = body.top_k;
 	if (
@@ -272,10 +260,6 @@ function pythonRequestBody(
 	return {
 		session_id:
 			typeof body.session_id === 'string' && body.session_id.trim() ? body.session_id : chatId,
-		session_token: requireString(body, 'session_token'),
-		kb_id: requireString(body, 'kb_id'),
-		project_id: requireString(body, 'project_id'),
-		department: requireString(body, 'department'),
 		...(topK === undefined ? {} : { top_k: topK as number }),
 		question
 	};

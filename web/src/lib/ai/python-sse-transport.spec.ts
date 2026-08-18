@@ -84,7 +84,7 @@ describe('Python SSE to AI SDK stream', () => {
 });
 
 describe('Python SSE chat request', () => {
-	it('forwards the scoped session capability token', async () => {
+	it('forwards only the server-owned session id', async () => {
 		const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
 			new Response('data: {"type":"done"}\n\n', {
 				status: 200,
@@ -97,18 +97,17 @@ describe('Python SSE chat request', () => {
 			messages: [{ id: 'u-1', role: 'user', parts: [{ type: 'text', text: '问题' }] }],
 			body: {
 				session_id: 's-1',
-				session_token: 't'.repeat(32),
-				kb_id: 'company',
-				project_id: 'p-1',
-				department: 'engineering'
+				top_k: 4
 			},
 			trigger: 'submit-message',
 			messageId: 'u-1',
 			abortSignal: undefined
 		});
 
-		expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({
-			session_token: 't'.repeat(32)
+		expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toEqual({
+			session_id: 's-1',
+			top_k: 4,
+			question: '问题'
 		});
 		fetch.mockRestore();
 	});

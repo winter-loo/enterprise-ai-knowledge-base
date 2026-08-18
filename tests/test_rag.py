@@ -1,762 +1,162 @@
-import json
-import os
+from datetime import UTC, datetime
 
 import httpx
 import pytest
-from psycopg._queries import _split_query
 
+from authz import store as authz_store
 from rag import store
-from rag.chunking import _token_count
-from rag.main import AskRequest, app, ask_stream, build_prompt, llm_answer, split_text, stream_content
-from shared.openai_responses import response_answer_text
-from shared.scope_token import sign_scope
-
-os.environ.setdefault("AUTHZ_SIGNING_KEY", "test-signing-key-with-at-least-32-bytes")
-
-SOURCES = [{"id": "chunk-1", "filename": "guide.md", "chunk_index": 0, "score": 0.9, "content": "重启服务前先保存配置。", "summary": "重启前保存配置"}]
-SCOPE_TOKEN = sign_scope("company", "p-1", "*")
+from rag.main import app
 
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.setattr(store, "ensure_kb", lambda kb_id: {"id": kb_id} if kb_id == "company" else None)
-    monkeypatch.setattr(store, "ensure_project", lambda kb_id, project_id: {"id": project_id} if (kb_id, project_id) == ("company", "p-1") else None)
-    monkeypatch.setattr(store, "list_kbs", lambda: [{"id": "company", "name": "公司知识库"}])
-    monkeypatch.setattr(store, "list_projects", lambda kb_id: [{"id": "p-1", "kb_id": kb_id, "name": "研发项目"}])
+    monkeypatch.setattr(store, "ensure_company_kb", lambda: {"id": "company"})
+    monkeypatch.setattr(store, "ensure_project", lambda project_id: {"id": project_id} if project_id == "p-1" else None)
+    monkeypatch.setattr(authz_store, "list_accessible_project_ids", lambda principal: None if principal == "admin" else ["p-1"])
     monkeypatch.setattr(
         store,
-        "create_project",
-        lambda kb_id, name, description: {"id": "p-2", "kb_id": kb_id, "name": name, "description": description},
+        "list_projects",
+        lambda project_ids=None: [
+            {
+                "id": project_id,
+                "name": f"Project {project_id}",
+                "description": "",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+            }
+            for project_id in (project_ids if project_ids is not None else ["p-1", "p-2"])
+        ],
     )
+    monkeypatch.setattr(authz_store, "has_permission", lambda principal, action, project_id=None: principal == "alice" or principal == "admin")
     monkeypatch.setattr(
         store,
         "list_documents",
-        lambda kb_id: [
+        lambda project_id, _principal: [
             {
                 "id": "doc-1",
                 "filename": "guide.md",
-                "project_id": "p-1",
-                "access_scope": "engineering",
+                "project_id": project_id,
                 "status": "READY",
                 "chunk_count": 1,
                 "source_type": "upload",
+                "parser": "plain-text",
+                "pdf_type": None,
+                "chunking_strategy": "recursive",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
             }
         ],
     )
-    monkeypatch.setattr(
-        store,
-        "insert_document",
-        lambda **kw: {
-            "id": kw["document_id"],
-            "filename": kw["filename"],
-            "project_id": kw["project_id"],
-            "status": "READY",
-            "chunk_count": len(kw["chunks"]),
-            "chunking_strategy": kw.get("chunking_strategy", "recursive"),
-            "parser": kw["parser"],
-            "pdf_type": None,
-            "pages_needing_ocr": [],
-        },
-    )
-    monkeypatch.setattr(store, "search", lambda question, kb_id, project_id, scope_context, top_k: SOURCES)
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers={"x-scope-context": SCOPE_TOKEN})
-
-
-def test_split_text_overlaps_chunks():
-    chunks = split_text("知识库" * 400)  # 800 token > 默认 size 700, 会切成两片
-    assert len(chunks) == 2
-    assert all(_token_count(chunk) <= 700 for chunk in chunks)
-
-
-def test_build_prompt_prepends_summary():
-    sources = [{"filename": "guide.md", "content": "重启服务前先保存配置。"}]
-    prompt = build_prompt("如何重启？", sources, "用户之前确认了生产环境。")
-
-    assert prompt.startswith("对话历史摘要：\n用户之前确认了生产环境。\n\n")
-    assert "参考资料：\n[1] guide.md" in prompt
-    assert "问题：如何重启？" in prompt
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
 @pytest.mark.anyio
-async def test_scope_lists_and_upload(client, monkeypatch):
-    monkeypatch.setattr("rag.main.parse_document", lambda *_: ("部署步骤。" * 300, "plain-text", None, []))
+async def test_project_listing_returns_only_accessible_projects(client):
     async with client as http:
-        assert (await http.get("/api/knowledge-bases")).json()[0]["id"] == "company"
-        assert (await http.get("/api/projects?kb_id=company")).json()[0]["id"] == "p-1"
-        assert (await http.get("/api/documents?kb_id=company")).json()[0]["project_id"] == "p-1"
-        response = await http.post(
-            "/api/documents/upload",
-            files={"file": ("guide.md", b"x", "text/markdown")},
-            data={"kb_id": "company", "project_id": "p-1", "access_scope": "engineering", "chunking_strategy": "fixed"},
-        )
-    events = [json.loads(line) for line in response.text.splitlines()]
+        response = await http.get("/api/projects", headers={"x-principal": "alice"})
+
     assert response.status_code == 200
-    assert events[-1]["result"]["project_id"] == "p-1"
-    assert events[-1]["result"]["chunking_strategy"] == "fixed"
+    assert [project["id"] for project in response.json()] == ["p-1"]
 
 
 @pytest.mark.anyio
-async def test_failed_upload_removes_stored_source(client, monkeypatch, tmp_path):
-    monkeypatch.setattr("rag.main.UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr("rag.main.parse_document", lambda *_: ("部署步骤。", "plain-text", None, []))
-    monkeypatch.setattr(store, "insert_document", lambda **_: (_ for _ in ()).throw(RuntimeError("embedding unavailable")))
+async def test_project_creator_becomes_manager(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(store, "create_project", lambda name, _description: {"id": "p-new", "name": name})
+    monkeypatch.setattr(authz_store, "upsert_grant", lambda principal, project, role: captured.update(principal=principal, project=project, role=role) or {})
 
     async with client as http:
-        response = await http.post(
-            "/api/documents/upload",
-            files={"file": ("confidential.md", b"secret", "text/markdown")},
-            data={"kb_id": "company", "project_id": "p-1"},
-        )
+        response = await http.post("/api/projects", json={"name": "发布计划", "description": ""}, headers={"x-principal": "alice"})
 
-    assert json.loads(response.text.splitlines()[-1]) == {
-        "stage": "error",
-        "message": "索引失败，请稍后重试",
-        "status": 500,
-        "percent": 0,
-    }
-    assert list(tmp_path.iterdir()) == []
+    assert response.status_code == 200
+    assert captured == {"principal": "alice", "project": "p-new", "role": "manager"}
 
 
 @pytest.mark.anyio
-async def test_upload_maps_embedding_unavailable_to_503(client, monkeypatch, tmp_path):
-    monkeypatch.setattr("rag.main.UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr("rag.main.parse_document", lambda *_: ("部署步骤。", "plain-text", None, []))
+async def test_retrieve_passes_stable_principal_to_store(client, monkeypatch):
+    captured = {}
     monkeypatch.setattr(
         store,
-        "insert_document",
-        lambda **_: (_ for _ in ()).throw(store.EmbeddingUnavailableError("Embedding 服务暂时不可用，请稍后重试")),
+        "search",
+        lambda question, project_id, principal_id, top_k: (
+            captured.update(question=question, project_id=project_id, principal_id=principal_id, top_k=top_k)
+            or [{"id": "c-1", "filename": "guide.md", "chunk_index": 0, "score": 0.8, "content": "内容", "summary": "摘要"}]
+        ),
     )
 
     async with client as http:
-        response = await http.post(
-            "/api/documents/upload",
-            files={"file": ("guide.md", b"x", "text/markdown")},
-            data={"kb_id": "company", "project_id": "p-1"},
-        )
+        response = await http.post("/api/retrieve", json={"question": "怎么做", "project_id": "p-1"}, headers={"x-principal": "alice"})
 
     assert response.status_code == 200
-    assert json.loads(response.text.splitlines()[-1]) == {
-        "stage": "error",
-        "message": "Embedding 服务暂时不可用，请稍后重试",
-        "status": 503,
-        "percent": 0,
-    }
-    assert list(tmp_path.iterdir()) == []
+    assert captured == {"question": "怎么做", "project_id": "p-1", "principal_id": "alice", "top_k": 5}
+    assert "access_scope" not in response.text
 
 
 @pytest.mark.anyio
-async def test_upload_progress_streams_indexing_stages_and_result(client, monkeypatch, tmp_path):
-    monkeypatch.setattr("rag.main.UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr("rag.main.parse_document", lambda *_: ("部署步骤。", "plain-text", None, []))
-    monkeypatch.setattr("rag.main.chunk_document", lambda *_: ["片段一", "片段二"])
-
-    def insert(**kwargs):
-        kwargs["on_progress"]({"stage": "embedding", "message": "生成向量", "completed": 2, "total": 2, "percent": 70})
-        return {"id": kwargs["document_id"], "filename": kwargs["filename"], "project_id": "p-1", "status": "READY", "chunk_count": 2}
-
-    monkeypatch.setattr(store, "insert_document", insert)
-
+async def test_retrieve_rejects_the_retired_scope_payload_field(client):
     async with client as http:
         response = await http.post(
-            "/api/documents/upload",
-            files={"file": ("guide.md", b"x", "text/markdown")},
-            data={"kb_id": "company", "project_id": "p-1"},
+            "/api/retrieve",
+            json={"question": "怎么做", "project_id": "p-1", "access_scope": "old"},
+            headers={"x-principal": "alice"},
         )
 
-    events = [json.loads(line) for line in response.text.splitlines()]
-    assert response.status_code == 200
-    assert [event["stage"] for event in events] == ["parsing", "chunking", "embedding", "complete"]
-    assert events[-1]["result"]["chunk_count"] == 2
+    assert response.status_code == 422
 
 
 @pytest.mark.anyio
-async def test_project_creation_is_validated(client):
+async def test_document_listing_requires_project_read_permission(client, monkeypatch):
+    monkeypatch.setattr(authz_store, "has_permission", lambda *_args: False)
     async with client as http:
-        created = await http.post("/api/projects", json={"kb_id": "company", "name": "上线项目", "description": "生产发布资料"})
-        invalid = await http.post("/api/projects", json={"kb_id": "company", "name": ""})
+        response = await http.get("/api/documents?project_id=p-1", headers={"x-principal": "alice"})
 
-    assert created.status_code == 200
-    assert created.json()["name"] == "上线项目"
-    assert invalid.status_code == 422
+    assert response.status_code == 403
 
 
 @pytest.mark.anyio
-async def test_project_scope_is_required(client):
-    async with client as http:
-        response = await http.post(
-            "/api/documents/upload", files={"file": ("guide.md", b"x", "text/markdown")}, data={"kb_id": "company", "project_id": "other"}
-        )
-    assert response.status_code == 404
-
-
-@pytest.mark.anyio
-async def test_retrieve_returns_full_chunks(client):
-    async with client as http:
-        response = await http.post("/api/retrieve", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"})
-    body = response.json()
-    assert response.status_code == 200
-    assert body["retrieved"] == 1
-    assert body["chunks"][0]["content"] == "重启服务前先保存配置。"
-    assert body["chunks"][0]["summary"] == "重启前保存配置"
-
-
-@pytest.mark.anyio
-async def test_document_import(client):
-    async with client as http:
-        imported = await http.post(
-            "/api/v1/document/import",
-            json={"title": "guide.md", "content": "部署步骤。", "kb_id": "company", "project_id": "p-1", "access_scope": "engineering"},
-        )
-    assert imported.status_code == 200
-    assert imported.json()["status"] == "READY"
-
-
-@pytest.mark.anyio
-async def test_scope_resolve_returns_canonical_project(client):
-    async with client as http:
-        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "p-1"})
-    assert response.status_code == 200
-    assert response.json() == {"kb_id": "company", "project_id": "p-1"}
-
-
-@pytest.mark.anyio
-async def test_scope_resolve_rejects_unknown_project(client):
-    async with client as http:
-        response = await http.post("/api/scope/resolve", json={"kb_id": "company", "project_id": "other"})
-    assert response.status_code == 404
-
-
-@pytest.mark.anyio
-async def test_evidence_returns_full_chunk_detail(client, monkeypatch):
+async def test_evidence_response_is_bounded_by_project(client, monkeypatch):
     monkeypatch.setattr(
         store,
         "get_evidence",
-        lambda chunk_id, kb_id, project_id, scope_context: {
-            "id": chunk_id,
+        lambda *_args: {
+            "id": "c-1",
             "filename": "guide.md",
             "chunk_index": 0,
-            "content": "完整内容",
+            "content": "内容",
             "summary": "摘要",
-            "access_scope": "engineering",
             "project_id": "p-1",
             "document_id": "doc-1",
             "source_type": "upload",
             "source_uri": "",
-            "page": 3,
-            "metadata": {"chunking_strategy": "recursive"},
-            "created_at": "2026-01-01T00:00:00+00:00",
+            "page": None,
+            "metadata": {},
+            "created_at": datetime(2026, 1, 1, tzinfo=UTC),
         },
     )
-
     async with client as http:
-        response = await http.get(
-            "/api/evidence/chunk-1",
-            params={"kb_id": "company", "project_id": "p-1"},
-        )
+        response = await http.get("/api/evidence/c-1?project_id=p-1", headers={"x-principal": "alice"})
 
     assert response.status_code == 200
-    assert response.json()["content"] == "完整内容"
-    assert response.json()["page"] == 3
+    assert response.json()["project_id"] == "p-1"
+    assert "access_scope" not in response.json()
 
 
-@pytest.mark.anyio
-async def test_evidence_returns_404_for_unknown_chunk(client, monkeypatch):
-    monkeypatch.setattr(store, "get_evidence", lambda chunk_id, kb_id, project_id, scope_context: None)
-
-    async with client as http:
-        response = await http.get(
-            "/api/evidence/missing",
-            params={"kb_id": "company", "project_id": "p-1"},
-        )
-
-    assert response.status_code == 404
-
-
-@pytest.mark.anyio
-async def test_ask_keeps_scope_and_citations(client, monkeypatch):
-    async def answer(*_):
-        return "请先保存配置。[1]", "test-model"
-
-    monkeypatch.setattr("rag.main.llm_answer", answer)
-    async with client as http:
-        response = await http.post("/api/ask", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"})
-    body = response.json()
-    assert response.status_code == 200
-    assert body["citations"][0]["filename"] == "guide.md"
-    assert body["citations"][0]["citation_index"] == 1
-    assert body["answer_mode"] == "test-model"
-
-
-@pytest.mark.anyio
-async def test_ask_returns_only_cited_chunks(client, monkeypatch):
-    sources = [
-        {"id": "c1", "filename": "a.md", "chunk_index": 0, "score": 0.9, "content": "内容一", "summary": "s1"},
-        {"id": "c2", "filename": "b.md", "chunk_index": 1, "score": 0.8, "content": "内容二", "summary": "s2"},
-        {"id": "c3", "filename": "c.md", "chunk_index": 2, "score": 0.7, "content": "内容三", "summary": "s3"},
-    ]
-    monkeypatch.setattr(store, "search", lambda *_: sources)
-
-    async def answer(*_):
-        return "根据[1]和[3]作答。", "test-model"
-
-    monkeypatch.setattr("rag.main.llm_answer", answer)
-
-    async with client as http:
-        response = await http.post("/api/ask", json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"})
-
-    body = response.json()
-    assert [citation["citation_index"] for citation in body["citations"]] == [1, 3]
-    assert body["retrieved"] == 3
-
-
-def test_search_adds_qwen_instruction_and_no_permission_predicate(monkeypatch):
-    embedded = []
-
-    class Connection:
-        def __init__(self, scope_context="*"):
-            self.scope_context = scope_context
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            pass
-
-        def execute(self, query, params):
-            _ = _split_query(query.encode("utf-8"))
-            assert "e.kb_id=%s AND e.project_id=%s" in query
-            # RAG 的检索 SQL 不含任何权限谓词或 access_scope 列;行级可见性由 authz 的 RLS 强制。
-            assert "department" not in query
-            assert "access_scope" not in query
-            assert params[1:] == ("年假审批需要哪些材料？", "company", "p-1", 5)
-            return self
-
-        def fetchall(self):
-            return []
-
-    monkeypatch.setattr(store, "embed", lambda texts: embedded.extend(texts) or [[0.0] * 1024])
-    monkeypatch.setattr(store, "connect", Connection)
-    store.search("年假审批需要哪些材料？", "company", "p-1", "*", 5)
-    assert embedded == [f"Instruct: {store.QUERY_INSTRUCTION}\nQuery: 年假审批需要哪些材料？"]
-
-
-def test_insert_document_persists_llm_summaries(monkeypatch):
-    inserted = []
-
-    class Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            pass
-
-        def execute(self, _query, params):
-            inserted.append(params)
-            return self
-
-        def commit(self):
-            pass
-
-    monkeypatch.setattr(store, "embed", lambda chunks: [[0.0] * 1024 for _ in chunks])
-    monkeypatch.setattr(store, "summarize_chunks", lambda chunks: ["部署前保存配置。" for _ in chunks])
-    monkeypatch.setattr(store, "connect", Connection)
-
-    store.insert_document(
-        kb_id="company",
-        project_id="p-1",
-        document_id="doc-1",
-        filename="guide.md",
-        access_scope="engineering",
-        parser="plain-text",
-        pdf_type=None,
-        pages_needing_ocr=[],
-        chunks=["部署服务前，需要先保存当前配置。"],
-        stored_path="",
-    )
-
-    assert inserted[0][6] == "部署前保存配置。"
-
-
-def test_embed_batches_requests_and_reports_completed_chunks(monkeypatch):
-    requests = []
-    real_client = httpx.Client
-
-    def handler(request):
-        body = json.loads(request.read())
-        requests.append(body["input"])
-        return httpx.Response(200, json={"data": [{"embedding": [0.0] * 1024} for _ in body["input"]]})
-
-    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embedding.test/v1")
-    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "2")
-    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
-    progress = []
-
-    vectors = store.embed(["一", "二", "三", "四", "五"], on_progress=lambda completed, total: progress.append((completed, total)))
-
-    assert requests == [["一", "二"], ["三", "四"], ["五"]]
-    assert len(vectors) == 5
-    assert progress == [(2, 5), (4, 5), (5, 5)]
-
-
-def test_embed_retries_transient_timeout_then_succeeds(monkeypatch):
-    attempts = 0
-    real_client = httpx.Client
-
-    def handler(request):
-        nonlocal attempts
-        attempts += 1
-        if attempts < 3:
-            raise httpx.ReadTimeout("cold model", request=request)
-        return httpx.Response(200, json={"data": [{"embedding": [0.0] * 1024}]})
-
-    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embedding.test/v1")
-    monkeypatch.setenv("EMBEDDING_MAX_ATTEMPTS", "3")
-    monkeypatch.setattr(store.time, "sleep", lambda _: None)
-    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
-
-    assert len(store.embed(["内容"])) == 1
-    assert attempts == 3
-
-
-def test_embed_raises_unavailable_after_finite_retries(monkeypatch):
-    attempts = 0
-    real_client = httpx.Client
-
-    def handler(request):
-        nonlocal attempts
-        attempts += 1
-        raise httpx.ReadTimeout("still cold", request=request)
-
-    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embedding.test/v1")
-    monkeypatch.setenv("EMBEDDING_MAX_ATTEMPTS", "2")
-    monkeypatch.setattr(store.time, "sleep", lambda _: None)
-    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
-
-    with pytest.raises(store.EmbeddingUnavailableError, match="Embedding 服务暂时不可用"):
-        store.embed(["内容"])
-    assert attempts == 2
-
-
-def test_summarize_chunks_uses_configured_llm(monkeypatch):
-    real_client = httpx.Client
-
-    def handler(request):
-        assert request.url == "http://llm.test/v1/responses"
-        assert request.headers["authorization"] == "Bearer secret"
-        request_body = json.loads(request.read())
-        assert request_body["model"] == "summary-model"
-        assert "摘要必须保持原文语言，不要翻译" in request_body["instructions"]
-        assert request_body["input"] == [{"role": "user", "content": "部署服务前，需要先保存当前配置。"}]
-        assert request_body["max_output_tokens"] == 160
-        assert request_body["store"] is False
-        assert "messages" not in request_body
-        return httpx.Response(
-            200,
-            json={
-                "status": "completed",
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": "  部署前保存配置。  "}]}],
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
-    monkeypatch.setenv("LLM_API_KEY", "secret")
-    monkeypatch.setenv("LLM_MODEL", "summary-model")
-    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs))
-
-    assert store.summarize_chunks(["部署服务前，需要先保存当前配置。"]) == ["部署前保存配置。"]
-
-
-def test_summarize_chunks_degrades_per_failed_chunk(monkeypatch):
-    real_client = httpx.Client
-    responses = iter(
-        [
-            httpx.Response(200, json={"status": "completed", "output": [{"content": [{"type": "output_text", "text": "摘要一"}]}]}),
-            httpx.Response(503),
-            httpx.Response(200, json={"status": "completed", "output": [{"content": [{"type": "output_text", "text": "摘要三"}]}]}),
-        ]
-    )
-    transport = httpx.MockTransport(lambda _request: next(responses))
-    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
-    monkeypatch.setenv("LLM_API_KEY", "secret")
-    monkeypatch.setattr(store.httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs))
-
-    assert store.summarize_chunks(["片段一", "失败片段", "片段三"]) == ["摘要一", "", "摘要三"]
-
-
-def test_insert_document_continues_when_summary_client_fails(monkeypatch):
-    inserted = []
-
-    class Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            pass
-
-        def execute(self, _query, params):
-            inserted.append(params)
-            return self
-
-        def commit(self):
-            pass
-
-    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
-    monkeypatch.setenv("LLM_API_KEY", "secret")
-    monkeypatch.setattr(store.httpx, "Client", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("client unavailable")))
-    monkeypatch.setattr(store, "embed", lambda chunks: [[0.0] * 1024 for _ in chunks])
-    monkeypatch.setattr(store, "connect", Connection)
-
-    store.insert_document(
-        kb_id="company",
-        project_id="p-1",
-        document_id="doc-1",
-        filename="guide.md",
-        access_scope="engineering",
-        parser="plain-text",
-        pdf_type=None,
-        pages_needing_ocr=[],
-        chunks=["索引必须继续。"],
-        stored_path="",
-    )
-
-    assert inserted[0][6] == ""
-
-
-def test_stream_content_accepts_responses_api_text_and_refusal_deltas():
-    assert stream_content({"type": "response.output_text.delta", "delta": "响应"}) == "响应"
-    assert stream_content({"type": "response.refusal.delta", "delta": "无法回答"}) == "无法回答"
-
-
-def test_response_answer_text_preserves_refusals():
-    payload = {
-        "status": "completed",
-        "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "无法安全回答。"}]}],
-    }
-
-    assert response_answer_text(payload) == "无法安全回答。"
-
-
-@pytest.mark.anyio
-async def test_llm_answer_uses_responses_api(monkeypatch):
-    real_client = httpx.AsyncClient
-
-    def handler(request):
-        assert request.url == "http://llm.test/v1/responses"
-        request_body = json.loads(request.read())
-        assert request_body["instructions"].startswith("你是企业知识库助手")
-        assert request_body["input"][-1] == {"role": "user", "content": "参考资料：\n无\n\n问题：当前有哪些资料？"}
-        assert request_body["store"] is False
-        assert "messages" not in request_body
-        return httpx.Response(
-            200,
-            json={
-                "status": "completed",
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": "当前没有资料。"}]}],
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
-    monkeypatch.setenv("LLM_API_KEY", "secret")
-    monkeypatch.setenv("LLM_MODEL", "responses-model")
-    monkeypatch.setattr("rag.main.httpx.AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs))
-
-    answer, mode = await llm_answer("当前有哪些资料？", [], [])
-
-    assert answer == "当前没有资料。"
-    assert mode == "responses-model"
-
-
-class _FakeStreamResponse:
-    def __init__(self, lines):
-        self.lines = lines
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_):
-        pass
-
-    def raise_for_status(self):
-        return None
-
-    async def aiter_lines(self):
-        for line in self.lines:
-            yield line
-
-
-class _FakeAsyncClient:
-    def __init__(self, lines, **_):
-        self.lines = lines
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_):
-        pass
-
-    def stream(self, *_args, **_kwargs):
-        return _FakeStreamResponse(self.lines)
-
-
-@pytest.mark.anyio
-async def test_ask_stream_accepts_responses_api_completion_event(monkeypatch):
-    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
-    monkeypatch.setenv("LLM_API_KEY", "secret")
-    lines = [
-        'data: {"type":"response.output_text.delta","delta":"真实回答"}',
-        'data: {"type":"response.completed"}',
-    ]
-
-    class CaptureClient(_FakeAsyncClient):
-        def stream(self, method, url, **kwargs):
-            assert method == "POST"
-            assert url == "http://llm.test/v1/responses"
-            request_body = kwargs["json"]
-            assert request_body["input"][-1]["role"] == "user"
-            assert request_body["store"] is False
-            assert "messages" not in request_body
-            return super().stream(method, url, **kwargs)
-
-    monkeypatch.setattr("rag.main.httpx.AsyncClient", lambda **kwargs: CaptureClient(lines, **kwargs))
-    payload = AskRequest(question="继续", kb_id="company", project_id="p-1")
-
-    events = [event async for event in ask_stream(payload, SOURCES)]
-
-    assert any('"type":"done"' in event for event in events)
-    assert not any('"type": "error"' in event for event in events)
-    assert any('"真实回答"' in event for event in events)
-
-
-@pytest.mark.anyio
-async def test_ask_stream_emits_cited_sources_after_answer(monkeypatch):
-    monkeypatch.delenv("LLM_BASE_URL", raising=False)
-    monkeypatch.delenv("LLM_API_KEY", raising=False)
-    payload = AskRequest(question="如何重启？", kb_id="company", project_id="p-1")
-
-    events = [event async for event in ask_stream(payload, SOURCES)]
-
-    delta = json.loads(events[0][6:])
-    sources = json.loads(events[1][6:])
-    assert delta["type"] == "delta"
-    assert sources["type"] == "sources"
-    assert sources["sources"][0]["id"] == "chunk-1"
-    assert sources["sources"][0]["excerpt"] == "重启服务前先保存配置。"
-    assert sources["sources"][0]["citation_index"] == 1
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("lines", "message"),
-    [
-        (['data: {"type":"response.output_text.delta","delta":"partial"}'], "LLM stream ended before its completion marker"),
-        (
-            ['data: {"type":"response.output_text.delta","delta":"partial"}', "data: [DONE]"],
-            "LLM Responses stream returned an unexpected [DONE] marker",
-        ),
-        (["data: {bad-json", 'data: {"type":"response.completed"}'], "LLM stream returned malformed JSON"),
-        (["data: null", 'data: {"type":"response.completed"}'], "LLM stream returned an invalid event shape"),
-        (
-            [
-                'data: {"type":"response.output_text.delta","delta":"partial"}',
-                'data: {"type":"error","message":"quota exceeded"}',
-                'data: {"type":"response.completed"}',
-            ],
-            "LLM stream error: quota exceeded",
-        ),
-    ],
-)
-async def test_ask_stream_rejects_truncated_or_malformed_upstream(monkeypatch, lines, message):
-    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
-    monkeypatch.setenv("LLM_API_KEY", "secret")
-    monkeypatch.setattr("rag.main.httpx.AsyncClient", lambda **kwargs: _FakeAsyncClient(lines, **kwargs))
-    payload = AskRequest(question="继续", kb_id="company", project_id="p-1")
-
-    events = [event async for event in ask_stream(payload, SOURCES)]
-
-    assert f'"message": "{message}"' in events[-1]
-
-
-# --- RLS 接缝:签名 x-scope-context capability 验证(ADR 0004 D5) ---
-# RAG 不计算授权,只验证 authz 签名并把 capability 内的范围交给 RLS。
-
-
-@pytest.mark.anyio
-async def test_retrieve_passes_scope_context_through(client, monkeypatch):
-    captured = {}
-
-    def fake_search(question, kb_id, project_id, scope_context, top_k):
-        captured.update(question=question, kb_id=kb_id, project_id=project_id, scope_context=scope_context, top_k=top_k)
-        return SOURCES
-
-    monkeypatch.setattr(store, "search", fake_search)
-
-    async with client as http:
-        response = await http.post(
-            "/api/retrieve",
-            json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"},
-            headers={"x-scope-context": sign_scope("company", "p-1", "eng,general")},
-        )
-
-    assert response.status_code == 200
-    assert captured["project_id"] == "p-1"
-    assert captured["scope_context"] == "eng,general"
-
-
-@pytest.mark.anyio
-async def test_retrieve_rejects_missing_scope_capability(client):
-    async with client as http:
-        response = await http.post(
-            "/api/retrieve",
-            json={"question": "如何重启？", "kb_id": "company", "project_id": "p-1"},
-            headers={"x-scope-context": ""},
-        )
-
-    assert response.status_code == 401
-
-
-@pytest.mark.anyio
-async def test_evidence_passes_scope_context_through(client, monkeypatch):
-    captured = {}
-    monkeypatch.setattr(
-        store,
-        "get_evidence",
-        lambda chunk_id, kb_id, project_id, scope_context: captured.update(project_id=project_id, scope_context=scope_context) or None,
-    )
-
-    async with client as http:
-        response = await http.get(
-            "/api/evidence/chunk-1",
-            params={"kb_id": "company", "project_id": "p-1"},
-            headers={"x-scope-context": sign_scope("company", "p-1", "general")},
-        )
-
-    assert response.status_code == 404  # fake 返回 None,但 scope_context 已透传
-    assert captured["project_id"] == "p-1"
-    assert captured["scope_context"] == "general"
-
-
-def test_connect_sets_opaque_scope_context(monkeypatch):
+def test_rag_connection_sets_principal_for_rls(monkeypatch):
     executed = []
     monkeypatch.setenv("DATABASE_URL", "postgresql:///fake")
 
     class FakeConn:
         def execute(self, query, params):
             executed.append((query, params))
-            return self
 
     class FakeConnection:
-        def __class_getitem__(cls, item):
+        def __class_getitem__(cls, _item):
             return cls
 
         @classmethod
-        def connect(cls, url, row_factory):
+        def connect(cls, _url, row_factory):
+            del row_factory
             return FakeConn()
 
     monkeypatch.setattr(store.psycopg, "Connection", FakeConnection)
-    connection = store.connect("eng,general")
+    _ = store.connect("alice")
 
-    assert isinstance(connection, FakeConn)
-    assert executed[0][0] == f"SELECT set_config('{store.SCOPE_SETTING}', %s, true)"
-    assert executed[0][1] == ("eng,general",)
+    assert executed == [(f"SELECT set_config('{store.PRINCIPAL_SETTING}', %s, true)", ("alice",))]

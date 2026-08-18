@@ -11,10 +11,10 @@
 		ChunkingStrategy,
 		DocumentRecord,
 		ImportResult,
-		IndexProgressEvent
+		IndexProgressEvent,
+		ProjectReference
 	} from '$lib/api/types';
 	import { rag } from '$lib/api/client';
-	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
@@ -26,12 +26,12 @@
 	let {
 		open = $bindable(false),
 		documents,
-		scope,
+		project,
 		onImported
 	}: {
 		open: boolean;
 		documents: DocumentRecord[];
-		scope: ChatScope;
+		project: ProjectReference;
 		onImported: (result: ImportResult) => Promise<void> | void;
 	} = $props();
 
@@ -57,7 +57,7 @@
 	let filteredDocuments = $derived(
 		documents.filter(
 			(document) =>
-				document.project_id === scope.projectId &&
+				document.project_id === project.projectId &&
 				document.filename.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
 		)
 	);
@@ -85,9 +85,7 @@
 			result = await rag.uploadDocument(
 				file,
 				{
-					kb_id: scope.kbId,
-					project_id: scope.projectId,
-					access_scope: 'general',
+					project_id: project.projectId,
 					chunking_strategy: strategy
 				},
 				{
@@ -129,9 +127,7 @@
 			result = await rag.importDocument({
 				title: title.trim(),
 				content: content.trim(),
-				kb_id: scope.kbId,
-				project_id: scope.projectId,
-				access_scope: 'general',
+				project_id: project.projectId,
 				chunking_strategy: strategy
 			});
 		} catch (error) {
@@ -210,8 +206,7 @@
 											<CheckCircle2Icon class="size-3.5 shrink-0 text-[var(--success)]" />
 										</div>
 										<p class="mt-1 text-[11px] leading-5 text-[var(--ink-muted)]">
-											{document.chunk_count} 个片段 · {document.access_scope} · {document.chunking_strategy ??
-												'recursive'}
+											{document.chunk_count} 个片段 · {document.chunking_strategy ?? 'recursive'}
 										</p>
 										<div class="mt-2 flex flex-wrap gap-2">
 											<Badge variant="secondary">{document.parser ?? document.source_type}</Badge>

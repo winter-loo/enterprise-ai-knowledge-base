@@ -40,25 +40,25 @@ _Avoid_: Source Coverage, lossless reconstruction, completeness
 
 ### Retrieval & Conversation
 
-**Scope**:
-The triple (kb_id, project_id, access_scope) that bounds which knowledge evidence a query may retrieve. Project controls the relevance boundary; access_scope is an opaque column RAG stores but does not interpret — the access boundary is decided by authz Grants and enforced by its RLS policy, never by a caller-supplied string.
-_Avoid_: 权限范围, context, boundary
+**Project**:
+The smallest authorization and retrieval boundary for knowledge within the company Knowledge Base. Documents and Chunks belong to one Project; knowledge requiring a different audience belongs in a different Project.
+_Avoid_: workspace, access partition, permission scope
 
 **Principal**:
-The identity of a caller (user or agent), carried by the trusted `x-principal` header and resolved by the authz service. Future SSO subjects plug into the same seam.
+The identity on whose behalf an operation is performed, such as a person, service, or agent.
 _Avoid_: user id (ambiguous), caller
 
 **Grant**:
-The unit of authorization binding a Principal to a Role over a Project, optionally narrowed to a Department (or its subtree). Visible Scope is derived from Grants; a Grant is never supplied by the caller.
+The unit of authorization binding a Principal to a Role over an entire Project. A Grant cannot be narrowed to a Department, Document, or Chunk.
 _Avoid_: permission (too narrow), ACL
 
-**Visible Scope**:
-The effective access a Principal holds within a Project: the set of Departments (public department plus granted subtrees), or the whole Project for a project-wide Grant. authz computes it and hands it to callers as an opaque scope_context; RAG passes it through to Postgres, whose authz-owned RLS policy enforces it at row level. RAG never interprets it.
-_Avoid_: 权限范围, scope filter, predicate
+**Project Role**:
+One of the fixed Viewer, Editor, or Manager roles on a Grant. Higher roles include the capabilities of lower roles; roles are not user-defined.
+_Avoid_: custom role, permission bundle
 
-**Scope Context**:
-An HMAC-signed, short-lived capability passed in the `x-scope-context` header. It binds the Visible Scope to one knowledge base and canonical project. RAG verifies the capability before applying its embedded `*` or department-id set to `app.visible_scope`.
-_Avoid_: scope, predicate, filter
+**Platform Administrator**:
+A globally provisioned Principal that may manage and read knowledge in every Project. A Platform Administrator does not bypass Session ownership.
+_Avoid_: superuser, root user
 
 **Retrieve**:
 A stateless primitive that turns a query into ranked Chunks from the knowledge base. It performs no generation and persists nothing.
@@ -73,8 +73,12 @@ A reference attached to a grounded answer identifying the Chunk it was drawn fro
 _Avoid_: source, reference, footnote
 
 **Session**:
-The identity and message History of one conversation, owned by the session service. The RAG service has no knowledge of Sessions.
+The identity and message History of one conversation, owned by the session service and one Session Owner. It belongs to a Project but is visible only to its owner while that owner retains a Grant.
 _Avoid_: chat, conversation, thread
+
+**Session Owner**:
+The Principal that created a Session. Project membership permits use of the Project knowledge; Session ownership permits reading that private conversation.
+_Avoid_: session token, browser secret
 
 **History**:
 The list of prior role/content messages a caller passes inline to Ask. The RAG service reads it but never stores it.

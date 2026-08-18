@@ -1,102 +1,85 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { Chat } from '@ai-sdk/svelte';
-	import { toast } from 'svelte-sonner';
-	import ArrowUpIcon from '@lucide/svelte/icons/arrow-up';
 	import ArchiveIcon from '@lucide/svelte/icons/archive';
-	import BookOpenCheckIcon from '@lucide/svelte/icons/book-open-check';
+	import ArrowUpIcon from '@lucide/svelte/icons/arrow-up';
 	import CircleStopIcon from '@lucide/svelte/icons/circle-stop';
 	import MenuIcon from '@lucide/svelte/icons/menu';
 	import PaperclipIcon from '@lucide/svelte/icons/paperclip';
 	import SearchIcon from '@lucide/svelte/icons/search';
 	import SparklesIcon from '@lucide/svelte/icons/sparkles';
-	import type { DocumentRecord, KnowledgeBase, Project } from '$lib/api/types';
-	import { authz, rag, session as sessionApi } from '$lib/api/client';
+	import { toast } from 'svelte-sonner';
+	import { rag, session as sessionApi } from '$lib/api/client';
+	import type {
+		ChatHistoryResponse,
+		ChatPromptMessage,
+		ChatSession,
+		DocumentRecord,
+		Project,
+		ProjectReference
+	} from '$lib/api/types';
 	import { PythonSseChatTransport, type PythonChatMessage } from '$lib/ai/python-sse-transport';
-	import {
-		createLocalSession,
-		historyToUIMessages,
-		isChatSessionStorageKey,
-		readActiveSessionId,
-		readSessions,
-		removeStoredSession,
-		titleFromQuestion,
-		uiMessagesToPromptHistory,
-		writeActiveSessionId,
-		writeSession,
-		type LocalChatSession
-	} from '$lib/chat/sessions';
-	import { shouldStartNewSession, type ChatScope } from '$lib/chat/scope-policy';
-	import { Button } from '$lib/components/ui/button';
-	import * as Sheet from '$lib/components/ui/sheet';
-	import { Textarea } from '$lib/components/ui/textarea';
-	import CreateScopeDialog from '$lib/components/CreateScopeDialog.svelte';
+	import BrandMark from '$lib/components/BrandMark.svelte';
+	import CreateProjectDialog from '$lib/components/CreateProjectDialog.svelte';
 	import KnowledgeDrawer from '$lib/components/KnowledgeDrawer.svelte';
 	import MessageBubble from '$lib/components/MessageBubble.svelte';
 	import QuickSearchDialog from '$lib/components/QuickSearchDialog.svelte';
-	import ScopeBar from '$lib/components/ScopeBar.svelte';
+	import ProjectBar from '$lib/components/ProjectBar.svelte';
 	import SessionSidebar from '$lib/components/SessionSidebar.svelte';
+	import { Button } from '$lib/components/ui/button';
+	import * as Sheet from '$lib/components/ui/sheet';
+	import { Textarea } from '$lib/components/ui/textarea';
 
 	const transport = new PythonSseChatTransport();
-	const emptyScope: ChatScope = { kbId: '', projectId: '', accessScope: '' };
-	const placeholderSession: LocalChatSession = {
-		id: 'initial',
-		token: '',
-		title: '新的研究',
-		createdAt: '',
-		updatedAt: '',
-		scope: emptyScope
-	};
+	const LAST_PROJECT_KEY = 'enterprise-kb.last-project';
+	const prompts = [
+		{ title: '制度问答', text: '请总结当前 Project 中最重要的制度与注意事项。' },
+		{ title: '项目脉络', text: '根据现有资料，梳理这个 Project 的关键里程碑与风险。' },
+		{ title: '查找差异', text: '现有文档之间是否有相互矛盾或需要澄清的内容？' }
+	];
 
-	let knowledgeBases = $state<KnowledgeBase[]>([]);
 	let projects = $state<Project[]>([]);
 	let documents = $state<DocumentRecord[]>([]);
-	let sessions = $state<LocalChatSession[]>([]);
-	let activeSession = $state<LocalChatSession>(placeholderSession);
-	let kbId = $state('');
+	let sessions = $state<ChatSession[]>([]);
 	let projectId = $state('');
-	let accessScope = $state('');
+	let activeSession = $state<ChatSession | null>(null);
 	let input = $state('');
 	let topK = $state(5);
 	let ready = $state(false);
+	let loadingProject = $state(false);
 	let serviceState = $state<'checking' | 'online' | 'offline'>('checking');
-	let loadingScope = $state(false);
 	let knowledgeOpen = $state(false);
 	let quickSearchOpen = $state(false);
-	let mobileNavOpen = $state(false);
-	let createKind = $state<'knowledge-base' | 'project'>('knowledge-base');
 	let createOpen = $state(false);
 	let createLoading = $state(false);
+	let mobileNavOpen = $state(false);
 	let messagesViewport = $state<HTMLElement>();
-	let chat = $state(createChat(placeholderSession.id, []));
-	let scopeRequestId = 0;
-	let scopeController: AbortController | undefined;
 	let incompleteMessageIds = $state<string[]>([]);
+	let chat = $state(createChat('placeholder', []));
 
-	let scope: ChatScope = $derived({ kbId, projectId, accessScope });
-	let quickSearchHistory = $derived(uiMessagesToPromptHistory(chat.messages));
-	let isGenerating = $derived(chat.status === 'submitted' || chat.status === 'streaming');
-	let activeKnowledgeBase = $derived(knowledgeBases.find((item) => item.id === kbId));
+	let project = $derived<ProjectReference>({ projectId });
 	let activeProject = $derived(projects.find((item) => item.id === projectId));
-	let visibleDocumentCount = $derived(
-		documents.filter((document) => document.project_id === projectId).length
+	let isGenerating = $derived(chat.status === 'submitted' || chat.status === 'streaming');
+	let visibleDocumentCount = $derived(documents.length);
+	let quickSearchHistory = $derived(
+		chat.messages
+			.filter((message) => message.role === 'user' || message.role === 'assistant')
+			.map((message) => ({
+				role: message.role,
+				content: message.parts
+					.filter((part) => part.type === 'text')
+					.map((part) => part.text)
+					.join('\n')
+			})) as ChatPromptMessage[]
 	);
-
-	const prompts = [
-		{ title: '制度核对', text: '请总结当前项目中最重要的制度要求，并标注依据。' },
-		{ title: '项目脉络', text: '根据现有资料，梳理这个项目的关键里程碑与风险。' },
-		{ title: '查找差异', text: '现有文档之间是否有相互矛盾或需要澄清的内容？' }
-	];
 
 	function createChat(sessionId: string, messages: PythonChatMessage[]): Chat<PythonChatMessage> {
 		return new Chat<PythonChatMessage>({
 			id: sessionId,
 			messages,
 			transport,
-			onFinish({ message, isAbort, isError }) {
-				if ((isAbort || isError) && message.parts.some((part) => part.type === 'text')) {
-					incompleteMessageIds = [...new Set([...incompleteMessageIds, message.id])];
-				}
+			onFinish() {
+				void refreshSessions();
 			},
 			onError(error) {
 				toast.error(error.message);
@@ -104,310 +87,114 @@
 		});
 	}
 
-	function apiScope(
-		value: ChatScope,
-		sessionToken: string
-	): {
-		kb_id: string;
-		project_id: string;
-		department: string;
-		session_token: string;
-	} {
-		return {
-			kb_id: value.kbId,
-			project_id: value.projectId,
-			// 会话服务仍以 department 作为会话范围字段名。
-			department: value.accessScope,
-			session_token: sessionToken
-		};
+	function historyToMessages(history: ChatHistoryResponse): PythonChatMessage[] {
+		return history.messages.map((message, index) => ({
+			id: `${history.session_id}-${index}`,
+			role: message.role,
+			parts: [{ type: 'text', text: message.content }]
+		})) as PythonChatMessage[];
 	}
 
-	function persistSession(next: LocalChatSession): boolean {
-		if (!writeSession(next)) return false;
-		sessions = readSessions();
-		return true;
-	}
-
-	function setActiveSession(session: LocalChatSession, messages: PythonChatMessage[] = []): void {
+	function setActiveSession(next: ChatSession | null, messages: PythonChatMessage[] = []): void {
 		incompleteMessageIds = [];
-		activeSession = session;
-		chat = createChat(session.id, messages);
-		writeActiveSessionId(session.id);
+		activeSession = next;
+		chat = createChat(next?.id ?? `project-${projectId || 'none'}`, messages);
 	}
 
-	function beginScopeRequest(): { id: number; signal: AbortSignal } {
-		scopeController?.abort();
-		scopeController = new AbortController();
-		scopeRequestId += 1;
-		loadingScope = true;
-		return { id: scopeRequestId, signal: scopeController.signal };
-	}
-
-	function finishScopeRequest(id: number): void {
-		if (id !== scopeRequestId) return;
-		loadingScope = false;
-		scopeController = undefined;
-	}
-
-	function cancelScopeRequest(): void {
-		scopeController?.abort();
-		scopeController = undefined;
-		scopeRequestId += 1;
-		loadingScope = false;
-	}
-
-	function isAbortError(error: unknown): boolean {
-		return error instanceof Error && error.name === 'AbortError';
-	}
-
-	async function resolveAuthorizedScope(
-		nextKbId: string,
-		nextProjectId: string,
-		signal?: AbortSignal
-	): Promise<ChatScope> {
-		const resolved = await authz.visibleScope(
-			{ kb_id: nextKbId, project_id: nextProjectId },
-			{ signal }
-		);
-		if (!resolved.allowed || !resolved.project_id || !resolved.scope_context) {
-			throw new Error('当前用户无权访问该项目');
+	async function refreshSessions(): Promise<void> {
+		if (!projectId) return;
+		sessions = await sessionApi.listSessions(projectId);
+		const currentSession = activeSession;
+		if (currentSession && !sessions.some((item) => item.id === currentSession.id)) {
+			setActiveSession(null);
 		}
-		return {
-			kbId: nextKbId,
-			projectId: resolved.project_id,
-			accessScope: resolved.scope_context
-		};
 	}
 
-	function newSession(nextScope: ChatScope = scope): boolean {
-		if (!nextScope.kbId || !nextScope.projectId) return false;
-		cancelScopeRequest();
-		if (isGenerating) void chat.stop();
-		let session: LocalChatSession;
+	async function refreshDocuments(): Promise<void> {
+		if (!projectId) return;
+		documents = await rag.listDocuments({ project_id: projectId });
+	}
+
+	async function changeProject(nextProjectId: string, force = false): Promise<void> {
+		if (!nextProjectId || (!force && nextProjectId === projectId)) return;
+		if (isGenerating) await chat.stop();
+		loadingProject = true;
 		try {
-			session = createLocalSession(nextScope);
+			const [nextDocuments, nextSessions] = await Promise.all([
+				rag.listDocuments({ project_id: nextProjectId }),
+				sessionApi.listSessions(nextProjectId)
+			]);
+			projectId = nextProjectId;
+			window.localStorage.setItem(LAST_PROJECT_KEY, nextProjectId);
+			documents = nextDocuments;
+			sessions = nextSessions;
+			if (nextSessions[0]) await openSession(nextSessions[0], true);
+			else setActiveSession(null);
 		} catch (error) {
-			toast.error(error instanceof Error ? error.message : '无法安全创建会话');
-			return false;
+			toast.error(error instanceof Error ? error.message : '无法切换 Project');
+		} finally {
+			loadingProject = false;
 		}
-		if (!persistSession(session)) {
-			toast.error('浏览器无法保存会话凭证，请释放本地存储空间后重试');
-			return false;
-		}
-		setActiveSession(session);
-		input = '';
-		return true;
 	}
 
 	async function initialize(): Promise<void> {
 		ready = false;
 		serviceState = 'checking';
 		try {
-			const [health, sessionHealth, kbs] = await Promise.all([
+			const [ragHealth, sessionHealth, nextProjects] = await Promise.all([
 				rag.health(),
 				sessionApi.health(),
-				rag.listKnowledgeBases()
+				rag.listProjects()
 			]);
-			const nextSessions = readSessions();
-			let remembered = nextSessions.find((session) => session.id === readActiveSessionId());
-			const nextKbId = kbs.some((kb) => kb.id === remembered?.scope.kbId)
-				? remembered!.scope.kbId
-				: (kbs[0]?.id ?? '');
-			if (!nextKbId) throw new Error('服务端没有可用的知识库');
-
-			const [nextProjects, nextDocuments] = await Promise.all([
-				rag.listProjects(nextKbId),
-				rag.listDocuments(nextKbId)
-			]);
-			const nextProjectId = nextProjects.some(
-				(project) => project.id === remembered?.scope.projectId
-			)
-				? remembered!.scope.projectId
-				: (nextProjects[0]?.id ?? '');
-			if (!nextProjectId) throw new Error('服务端没有可用的项目范围');
-			const resolvedScope = await resolveAuthorizedScope(nextKbId, nextProjectId);
-			let restoredMessages: PythonChatMessage[] | undefined;
-			if (remembered && !shouldStartNewSession(remembered.scope, resolvedScope)) {
-				try {
-					const history = await sessionApi.getHistory(
-						remembered.id,
-						apiScope(remembered.scope, remembered.token)
-					);
-					restoredMessages = historyToUIMessages(history.messages) as PythonChatMessage[];
-				} catch {
-					remembered = undefined;
-					toast.warning('原会话无法恢复，已在相同资料范围中新建会话');
-				}
-			}
-			knowledgeBases = kbs;
 			projects = nextProjects;
-			documents = nextDocuments;
-			sessions = nextSessions;
-			kbId = nextKbId;
-			projectId = resolvedScope.projectId;
-			accessScope = resolvedScope.accessScope;
-			if (remembered && restoredMessages) setActiveSession(remembered, restoredMessages);
-			else if (!newSession(resolvedScope)) throw new Error('无法持久化安全会话，工作台未启用');
-			serviceState = health.status === 'ok' && sessionHealth.status === 'ok' ? 'online' : 'offline';
+			serviceState =
+				ragHealth.status === 'ok' && sessionHealth.status === 'ok' ? 'online' : 'offline';
+			const remembered = window.localStorage.getItem(LAST_PROJECT_KEY);
+			const firstProject = nextProjects.find((item) => item.id === remembered) ?? nextProjects[0];
 			ready = true;
+			if (firstProject) await changeProject(firstProject.id, true);
 		} catch (error) {
 			serviceState = 'offline';
 			toast.error(error instanceof Error ? error.message : '无法连接知识库服务');
 		}
 	}
 
-	onMount(() => {
-		const syncSessions = (event: StorageEvent) => {
-			if (!isChatSessionStorageKey(event.key)) return;
-			const nextSessions = readSessions();
-			sessions = nextSessions;
-			const storedActive = nextSessions.find((session) => session.id === activeSession.id);
-			if (storedActive) {
-				activeSession = storedActive;
-			} else if (activeSession.id !== placeholderSession.id) {
-				if (isGenerating) void chat.stop();
-				if (!newSession(scope)) {
-					setActiveSession(placeholderSession);
-					ready = false;
-					serviceState = 'offline';
-				}
-			}
-		};
-		window.addEventListener('storage', syncSessions);
-		void initialize();
-		return () => {
-			window.removeEventListener('storage', syncSessions);
-			scopeController?.abort();
-		};
-	});
-
-	$effect(() => {
-		const messageCount = chat.messages.length;
-		const scrollTrigger = `${messageCount}:${chat.status}`;
-		void tick().then(() => {
-			if (scrollTrigger && messageCount > 0 && messagesViewport) {
-				messagesViewport.scrollTop = messagesViewport.scrollHeight;
-			}
-		});
-	});
-
-	async function refreshDocuments(): Promise<void> {
-		if (kbId) documents = await rag.listDocuments(kbId);
-	}
-
-	async function changeKnowledgeBase(value: string): Promise<void> {
-		if (!value || value === activeSession.scope.kbId) return;
-		const request = beginScopeRequest();
+	async function newSession(): Promise<ChatSession | null> {
+		if (!projectId || loadingProject) return null;
 		try {
-			const [nextProjects, nextDocuments] = await Promise.all([
-				rag.listProjects(value, { signal: request.signal }),
-				rag.listDocuments(value, { signal: request.signal })
-			]);
-			if (request.id !== scopeRequestId) return;
-			const nextProjectId = nextProjects[0]?.id ?? '';
-			if (!nextProjectId) throw new Error('该知识库没有可用项目');
-			const nextScope = await resolveAuthorizedScope(value, nextProjectId, request.signal);
-			if (!newSession(nextScope)) return;
-			kbId = value;
-			projects = nextProjects;
-			projectId = nextScope.projectId;
-			accessScope = nextScope.accessScope;
-			documents = nextDocuments;
+			const created = await sessionApi.createSession({ project_id: projectId });
+			sessions = [created, ...sessions];
+			setActiveSession(created);
+			return created;
 		} catch (error) {
-			if (request.id === scopeRequestId && !isAbortError(error)) {
-				toast.error(error instanceof Error ? error.message : '无法切换知识库');
-			}
-		} finally {
-			finishScopeRequest(request.id);
+			toast.error(error instanceof Error ? error.message : '无法创建会话');
+			return null;
 		}
 	}
 
-	async function changeProject(value: string): Promise<void> {
-		if (!value || value === activeSession.scope.projectId) return;
-		const request = beginScopeRequest();
-		try {
-			const nextScope = await resolveAuthorizedScope(kbId, value, request.signal);
-			if (request.id !== scopeRequestId || !newSession(nextScope)) return;
-			projectId = nextScope.projectId;
-			accessScope = nextScope.accessScope;
-		} catch (error) {
-			if (request.id === scopeRequestId && !isAbortError(error)) {
-				toast.error(error instanceof Error ? error.message : '无法切换项目');
-			}
-		} finally {
-			finishScopeRequest(request.id);
-		}
-	}
-
-	async function openSession(session: LocalChatSession): Promise<void> {
-		if (session.id === activeSession.id) {
+	async function openSession(next: ChatSession, alreadyCurrentProject = false): Promise<void> {
+		if (!alreadyCurrentProject && next.id === activeSession?.id) {
 			mobileNavOpen = false;
 			return;
 		}
 		if (isGenerating) await chat.stop();
-		const request = beginScopeRequest();
 		try {
-			const [nextProjects, nextDocuments] = await Promise.all([
-				rag.listProjects(session.scope.kbId, { signal: request.signal }),
-				rag.listDocuments(session.scope.kbId, { signal: request.signal })
-			]);
-			if (request.id !== scopeRequestId) return;
-			const nextProjectId = nextProjects.some((project) => project.id === session.scope.projectId)
-				? session.scope.projectId
-				: (nextProjects[0]?.id ?? '');
-			if (!nextProjectId) throw new Error('该知识库没有可用项目');
-			const nextScope = await resolveAuthorizedScope(
-				session.scope.kbId,
-				nextProjectId,
-				request.signal
-			);
-			if (shouldStartNewSession(session.scope, nextScope)) {
-				if (!newSession(nextScope)) return;
-				toast.info('项目或权限范围已变化，已新建安全会话');
-			} else {
-				const history = await sessionApi.getHistory(
-					session.id,
-					apiScope(nextScope, session.token),
-					{ signal: request.signal }
-				);
-				setActiveSession(session, historyToUIMessages(history.messages) as PythonChatMessage[]);
-			}
-			kbId = nextScope.kbId;
-			projectId = nextScope.projectId;
-			accessScope = nextScope.accessScope;
-			projects = nextProjects;
-			documents = nextDocuments;
+			const history = await sessionApi.getHistory(next.id);
+			setActiveSession(next, historyToMessages(history));
 			mobileNavOpen = false;
 		} catch (error) {
-			if (request.id === scopeRequestId && !isAbortError(error)) {
-				toast.error(error instanceof Error ? error.message : '无法恢复会话');
-			}
-		} finally {
-			finishScopeRequest(request.id);
+			if (error instanceof Error) toast.warning(error.message);
+			await refreshSessions();
 		}
 	}
 
-	async function deleteSession(session: LocalChatSession): Promise<void> {
-		if (!window.confirm(`删除“${session.title}”及其服务器消息？此操作无法撤销。`)) return;
+	async function deleteSession(next: ChatSession): Promise<void> {
+		if (!window.confirm(`删除“${next.title}”及其服务器消息？此操作无法撤销。`)) return;
 		try {
-			cancelScopeRequest();
-			if (session.id === activeSession.id && isGenerating) await chat.stop();
-			await sessionApi.clearSession(session.id, apiScope(session.scope, session.token));
-			if (!removeStoredSession(session.id)) {
-				toast.warning('服务器会话已删除，但浏览器未能更新本地列表；刷新后可再次清理条目');
-				return;
-			}
-			const remaining = readSessions();
-			sessions = remaining;
-			if (session.id === activeSession.id) {
-				const next = remaining[0];
-				if (next) await openSession(next);
-				else if (!newSession()) {
-					setActiveSession(placeholderSession);
-					ready = false;
-					serviceState = 'offline';
-				}
-			}
+			if (next.id === activeSession?.id && isGenerating) await chat.stop();
+			await sessionApi.clearSession(next.id);
+			sessions = sessions.filter((item) => item.id !== next.id);
+			if (next.id === activeSession?.id) setActiveSession(null);
 			toast.success('会话已删除');
 		} catch (error) {
 			toast.error(error instanceof Error ? error.message : '删除会话失败');
@@ -416,42 +203,16 @@
 
 	async function send(text = input): Promise<void> {
 		const question = text.trim();
-		if (
-			!question ||
-			!ready ||
-			serviceState !== 'online' ||
-			loadingScope ||
-			isGenerating ||
-			!projectId ||
-			activeSession.id === placeholderSession.id ||
-			shouldStartNewSession(activeSession.scope, scope)
-		)
-			return;
+		if (!question || !ready || serviceState !== 'online' || loadingProject || isGenerating) return;
+		const session = activeSession ?? (await newSession());
+		if (!session) return;
 		input = '';
-		const now = new Date().toISOString();
-		const updated = {
-			...activeSession,
-			title: activeSession.title === '新的研究' ? titleFromQuestion(question) : activeSession.title,
-			updatedAt: now
-		};
-		activeSession = updated;
-		if (!persistSession(updated)) {
-			toast.error('无法保存会话状态，消息尚未发送');
-			return;
+		if (session.title === '新的研究') {
+			const title = question.replace(/\s+/g, ' ').slice(0, 36);
+			activeSession = { ...session, title };
+			sessions = sessions.map((item) => (item.id === session.id ? { ...item, title } : item));
 		}
-		await chat.sendMessage(
-			{ text: question },
-			{
-				body: {
-					session_id: activeSession.id,
-					session_token: activeSession.token,
-					kb_id: kbId,
-					project_id: projectId,
-					department: accessScope,
-					top_k: topK
-				}
-			}
-		);
+		await chat.sendMessage({ text: question }, { body: { session_id: session.id, top_k: topK } });
 	}
 
 	function composerKeydown(event: KeyboardEvent): void {
@@ -461,102 +222,49 @@
 		}
 	}
 
-	function openCreate(kind: 'knowledge-base' | 'project'): void {
-		createKind = kind;
-		createOpen = true;
-	}
-
-	async function createScope(name: string, description: string): Promise<boolean> {
+	async function createProject(name: string, description: string): Promise<boolean> {
 		createLoading = true;
-		let createdScope: ChatScope;
 		try {
-			if (createKind === 'knowledge-base') {
-				const created = await rag.createKnowledgeBase({ name, description });
-				createdScope = await resolveAuthorizedScope(created.id, created.default_project_id);
-			} else {
-				const created = await rag.createProject({ kb_id: kbId, name, description });
-				createdScope = await resolveAuthorizedScope(kbId, created.id);
-			}
-		} catch (error) {
-			toast.error(error instanceof Error ? error.message : '创建失败');
-			createLoading = false;
-			return false;
-		}
-
-		createOpen = false;
-		const optimisticProject: Project = {
-			id: createdScope.projectId,
-			kb_id: createdScope.kbId,
-			name: createKind === 'knowledge-base' ? '默认项目' : name,
-			description: createKind === 'knowledge-base' ? '默认项目范围' : description,
-			created_at: new Date().toISOString()
-		};
-		if (createKind === 'knowledge-base') {
-			knowledgeBases = [
-				...knowledgeBases,
-				{
-					id: createdScope.kbId,
-					name,
-					description,
-					created_at: new Date().toISOString()
-				}
-			];
-		} else if (!projects.some((project) => project.id === createdScope.projectId)) {
-			projects = [...projects, optimisticProject];
-		}
-		if (!newSession(createdScope)) {
-			toast.warning(
-				`${createKind === 'knowledge-base' ? '知识库' : '项目'}已创建，但当前范围未切换`
-			);
-			createLoading = false;
+			const created = await rag.createProject({ name, description });
+			projects = [...projects, created];
+			createOpen = false;
+			await changeProject(created.id, true);
+			toast.success('Project 已创建');
 			return true;
-		}
-		toast.success(`${createKind === 'knowledge-base' ? '知识库' : '项目'}已创建`);
-		kbId = createdScope.kbId;
-		projectId = createdScope.projectId;
-		projects =
-			createKind === 'knowledge-base'
-				? [optimisticProject]
-				: projects.some((project) => project.id === createdScope.projectId)
-					? projects
-					: [...projects, optimisticProject];
-		if (createKind === 'knowledge-base') documents = [];
-		const refreshSessionId = activeSession.id;
-		try {
-			const [nextKbs, nextProjects] = await Promise.all([
-				rag.listKnowledgeBases(),
-				rag.listProjects(createdScope.kbId)
-			]);
-			knowledgeBases = nextKbs;
-			if (activeSession.id === refreshSessionId && kbId === createdScope.kbId) {
-				projects = nextProjects;
-			}
 		} catch (error) {
-			toast.warning(
-				error instanceof Error
-					? `已创建，但刷新失败：${error.message}`
-					: '已创建，但范围列表刷新失败'
-			);
+			toast.error(error instanceof Error ? error.message : '创建 Project 失败');
+			return false;
 		} finally {
 			createLoading = false;
 		}
-		return true;
 	}
+
+	onMount(() => {
+		void initialize();
+	});
+
+	$effect(() => {
+		const messageCount = chat.messages.length;
+		void tick().then(() => {
+			if (messageCount > 0 && messagesViewport)
+				messagesViewport.scrollTop = messagesViewport.scrollHeight;
+		});
+	});
 </script>
 
 <svelte:head>
 	<title>知屿 · 企业知识助手</title>
-	<meta name="description" content="可追溯、可控范围的企业 AI 知识问答工作台" />
+	<meta name="description" content="以 Project 为最小权限边界的企业知识问答工作台" />
 </svelte:head>
 
 <div class="app-frame h-dvh overflow-hidden bg-[var(--paper)] text-[var(--ink)]">
 	<aside class="hidden min-h-0 border-r border-[var(--line)] bg-[var(--paper-deep)] lg:block">
 		<SessionSidebar
 			{sessions}
-			activeId={activeSession.id}
-			onNew={() => newSession()}
-			onOpen={(session) => void openSession(session)}
-			onDelete={(session) => void deleteSession(session)}
+			activeId={activeSession?.id ?? ''}
+			onNew={() => void newSession()}
+			onOpen={(item) => void openSession(item)}
+			onDelete={(item) => void deleteSession(item)}
 			onOpenKnowledge={() => (knowledgeOpen = true)}
 			onOpenQuickSearch={() => (quickSearchOpen = true)}
 		/>
@@ -576,29 +284,25 @@
 			<div class="min-w-0 flex-1">
 				<div class="flex min-w-0 items-center gap-2">
 					<h1 class="truncate font-heading text-lg font-medium sm:text-xl">
-						{activeSession.title}
+						{activeSession?.title ?? activeProject?.name ?? '选择 Project'}
 					</h1>
 					<span class="hidden size-1 rounded-full bg-[var(--line-strong)] sm:block"></span>
 					<span
 						class="hidden truncate text-[10px] font-bold tracking-[0.14em] text-[var(--ink-faint)] uppercase sm:block"
-						>{activeProject?.name ?? '加载范围'}</span
+						>{activeProject?.name ?? '未选择'}</span
 					>
 				</div>
 				<p class="mt-0.5 truncate text-[10px] text-[var(--ink-faint)]">
-					{activeKnowledgeBase?.name ?? '企业知识工作台'} · {visibleDocumentCount} 份可见资料
+					公司知识库 · {visibleDocumentCount} 份当前 Project 资料
 				</p>
 			</div>
 			<div class="flex items-center gap-2">
-				<div
-					class="mr-1 hidden items-center gap-2 text-[10px] text-[var(--ink-faint)] sm:flex"
-					title="健康接口仅表示 API 服务存活"
-				>
+				<div class="mr-1 hidden items-center gap-2 text-[10px] text-[var(--ink-faint)] sm:flex">
 					<span
 						class:status-online={serviceState === 'online'}
 						class:status-offline={serviceState === 'offline'}
 						class="status-dot"
-					></span>
-					{serviceState === 'online'
+					></span>{serviceState === 'online'
 						? '服务在线'
 						: serviceState === 'offline'
 							? '连接异常'
@@ -608,12 +312,14 @@
 					variant="ghost"
 					size="icon-sm"
 					onclick={() => (quickSearchOpen = true)}
-					aria-label="快速检索"><SearchIcon /></Button
+					aria-label="快速检索"
+					disabled={!projectId}><SearchIcon /></Button
 				>
 				<Button
 					variant="outline"
 					class="hidden rounded-lg tracking-normal normal-case sm:inline-flex"
-					onclick={() => (knowledgeOpen = true)}><ArchiveIcon />知识资料</Button
+					onclick={() => (knowledgeOpen = true)}
+					disabled={!projectId}><ArchiveIcon />知识资料</Button
 				>
 			</div>
 		</header>
@@ -623,21 +329,31 @@
 			class="conversation-scroll min-h-0 flex-1 overflow-y-auto scroll-smooth"
 		>
 			<div class="mx-auto flex min-h-full w-full max-w-4xl flex-col px-4 py-8 sm:px-8 sm:py-10">
-				{#if !ready || loadingScope}
+				{#if !ready || loadingProject}
 					<div class="grid flex-1 place-items-center">
 						<div class="text-center">
 							<div class="knowledge-loader mx-auto mb-4"></div>
 							<p class="text-xs tracking-[0.12em] text-[var(--ink-faint)] uppercase">
-								正在校准知识范围
+								正在加载 Project
 							</p>
 						</div>
+					</div>
+				{:else if !projectId}
+					<div class="my-auto text-center">
+						<BrandMark size={48} />
+						<h2 class="mt-5 font-heading text-3xl">还没有可访问的 Project</h2>
+						<p class="mt-3 text-sm text-[var(--ink-muted)]">
+							Manager 或平台管理员可以创建第一个 Project。
+						</p>
+						<Button class="mt-6 rounded-xl" onclick={() => (createOpen = true)}>新建 Project</Button
+						>
 					</div>
 				{:else if chat.messages.length === 0}
 					<div class="empty-enter my-auto py-8 sm:py-14">
 						<div class="mb-6 flex items-center gap-3">
 							<span class="h-px w-12 bg-[var(--signal)]"></span><span
 								class="text-[10px] font-bold tracking-[0.2em] text-[var(--signal)] uppercase"
-								>Grounded intelligence</span
+								>Project grounded intelligence</span
 							>
 						</div>
 						<h2
@@ -646,34 +362,32 @@
 							让企业知识<br /><em class="font-normal text-[var(--signal)]">有据可循。</em>
 						</h2>
 						<p class="mt-5 max-w-xl text-sm leading-7 text-[var(--ink-muted)] sm:text-base">
-							在当前选择的资料范围内检索、交叉核对，并把每个结论连接回原始证据。
+							当前 Project 是一个独立的检索、知识和权限边界。你的会话只对自己可见。
 						</p>
 						<div class="mt-9 grid gap-2 sm:grid-cols-3">
-							{#each prompts as prompt, index (prompt.title)}
-								<button
+							{#each prompts as prompt, index (prompt.title)}<button
 									type="button"
 									class="prompt-card group rounded-2xl border border-[var(--line)] bg-white/45 p-4 text-left"
-									disabled={!ready || serviceState !== 'online' || loadingScope}
+									disabled={serviceState !== 'online'}
 									onclick={() => void send(prompt.text)}
-								>
-									<div class="mb-5 flex items-center justify-between">
+									><div class="mb-5 flex items-center justify-between">
 										<span class="font-mono text-[10px] text-[var(--ink-faint)]">0{index + 1}</span
 										><SparklesIcon
 											class="size-3.5 text-[var(--signal)] opacity-0 transition group-hover:opacity-100"
 										/>
 									</div>
 									<div class="text-xs font-bold tracking-[0.08em]">{prompt.title}</div>
-									<p class="mt-2 text-xs leading-5 text-[var(--ink-muted)]">{prompt.text}</p>
-								</button>
-							{/each}
+									<p class="mt-2 text-xs leading-5 text-[var(--ink-muted)]">
+										{prompt.text}
+									</p></button
+								>{/each}
 						</div>
 					</div>
 				{:else}
 					<div class="grid gap-8 pb-5">
-						{#each chat.messages as message, index (message.id)}
-							<MessageBubble
+						{#each chat.messages as message, index (message.id)}<MessageBubble
 								{message}
-								{scope}
+								{project}
 								incomplete={(chat.status === 'error' &&
 									index === chat.messages.length - 1 &&
 									message.role === 'assistant') ||
@@ -681,29 +395,7 @@
 								streaming={isGenerating &&
 									index === chat.messages.length - 1 &&
 									message.role === 'assistant'}
-							/>
-						{/each}
-						{#if chat.status === 'submitted'}
-							<div class="message-enter grid grid-cols-[36px_minmax(0,1fr)] gap-4">
-								<div
-									class="grid size-9 place-items-center rounded-[10px] bg-[var(--ink)] text-[var(--paper)]"
-								>
-									<BookOpenCheckIcon class="size-4" />
-								</div>
-								<div>
-									<div
-										class="text-[11px] font-bold tracking-[0.16em] text-[var(--ink-muted)] uppercase"
-									>
-										知识助手
-									</div>
-									<div class="mt-3 flex gap-1.5">
-										<span class="thinking-bar"></span><span class="thinking-bar"></span><span
-											class="thinking-bar"
-										></span>
-									</div>
-								</div>
-							</div>
-						{/if}
+							/>{/each}
 					</div>
 				{/if}
 			</div>
@@ -718,19 +410,14 @@
 						bind:value={input}
 						onkeydown={composerKeydown}
 						maxlength={2000}
-						disabled={!ready || serviceState !== 'online' || loadingScope}
-						placeholder="询问当前知识范围内的任何问题……"
+						disabled={!ready || serviceState !== 'online' || loadingProject || !projectId}
+						placeholder="询问当前 Project 内的任何问题……"
 						class="max-h-40 min-h-12 border-0 px-3 py-2.5 text-[15px] leading-6 focus-visible:border-0"
-					/>
-					<ScopeBar
-						{knowledgeBases}
+					/><ProjectBar
 						{projects}
-						{kbId}
 						{projectId}
-						disabled={!ready || loadingScope || isGenerating || createLoading}
-						onCreateKnowledgeBase={() => openCreate('knowledge-base')}
-						onCreateProject={() => openCreate('project')}
-						onKnowledgeBaseChange={(value) => void changeKnowledgeBase(value)}
+						disabled={!ready || loadingProject || isGenerating || createLoading}
+						onCreateProject={() => (createOpen = true)}
 						onProjectChange={(value) => void changeProject(value)}
 					/>
 					<div class="flex items-center gap-1.5 px-1 pb-1">
@@ -738,9 +425,9 @@
 							variant="ghost"
 							size="icon-sm"
 							onclick={() => (knowledgeOpen = true)}
+							disabled={!projectId}
 							aria-label="上传知识资料"><PaperclipIcon /></Button
-						>
-						<label
+						><label
 							class="ml-1 hidden items-center gap-2 text-[10px] text-[var(--ink-faint)] sm:flex"
 							>召回 <input
 								type="range"
@@ -749,20 +436,15 @@
 								bind:value={topK}
 								class="w-20 accent-[var(--signal)]"
 							/><span class="w-3 font-mono">{topK}</span></label
-						>
-						<span class="ml-auto hidden text-[10px] text-[var(--ink-faint)] sm:block"
+						><span class="ml-auto hidden text-[10px] text-[var(--ink-faint)] sm:block"
 							>Enter 发送 · Shift + Enter 换行</span
-						>
-						{#if isGenerating}
-							<Button
+						>{#if isGenerating}<Button
 								size="icon-sm"
 								variant="outline"
 								class="ml-2 rounded-xl"
 								onclick={() => void chat.stop()}
 								aria-label="停止生成"><CircleStopIcon /></Button
-							>
-						{:else}
-							<Button
+							>{:else}<Button
 								size="icon-sm"
 								class="ml-2 rounded-xl"
 								onclick={() => void send()}
@@ -770,14 +452,13 @@
 									!projectId ||
 									!ready ||
 									serviceState !== 'online' ||
-									loadingScope}
+									loadingProject}
 								aria-label="发送问题"><ArrowUpIcon /></Button
-							>
-						{/if}
+							>{/if}
 					</div>
 				</div>
 				<p class="mt-2 text-center text-[9px] tracking-[0.04em] text-[var(--ink-faint)]">
-					回答仅基于当前所选范围内的已索引资料；重要决策请核对原文。
+					回答仅基于当前 Project 的已索引资料；重要决策请核对原文。
 				</p>
 			</div>
 		</footer>
@@ -788,18 +469,17 @@
 	<Sheet.Content
 		side="left"
 		class="w-[min(88vw,19rem)] border-[var(--line)] bg-[var(--paper-deep)] p-0"
-	>
-		<Sheet.Title class="sr-only">会话导航</Sheet.Title>
-		<Sheet.Description class="sr-only">打开历史研究或新建会话</Sheet.Description>
-		<SessionSidebar
+		><Sheet.Title class="sr-only">会话导航</Sheet.Title><Sheet.Description class="sr-only"
+			>打开历史研究或新建会话</Sheet.Description
+		><SessionSidebar
 			{sessions}
-			activeId={activeSession.id}
+			activeId={activeSession?.id ?? ''}
 			onNew={() => {
-				newSession();
+				void newSession();
 				mobileNavOpen = false;
 			}}
-			onOpen={(session) => void openSession(session)}
-			onDelete={(session) => void deleteSession(session)}
+			onOpen={(item) => void openSession(item)}
+			onDelete={(item) => void deleteSession(item)}
 			onOpenKnowledge={() => {
 				knowledgeOpen = true;
 				mobileNavOpen = false;
@@ -808,15 +488,10 @@
 				quickSearchOpen = true;
 				mobileNavOpen = false;
 			}}
-		/>
-	</Sheet.Content>
+		/></Sheet.Content
+	>
 </Sheet.Root>
 
-<KnowledgeDrawer bind:open={knowledgeOpen} {documents} {scope} onImported={refreshDocuments} />
-<QuickSearchDialog bind:open={quickSearchOpen} {scope} history={quickSearchHistory} />
-<CreateScopeDialog
-	bind:open={createOpen}
-	kind={createKind}
-	loading={createLoading}
-	onSubmit={createScope}
-/>
+<KnowledgeDrawer bind:open={knowledgeOpen} {documents} {project} onImported={refreshDocuments} />
+<QuickSearchDialog bind:open={quickSearchOpen} {project} history={quickSearchHistory} />
+<CreateProjectDialog bind:open={createOpen} loading={createLoading} onSubmit={createProject} />

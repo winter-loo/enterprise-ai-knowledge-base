@@ -5,7 +5,7 @@
 	import PlusIcon from '@lucide/svelte/icons/plus';
 	import SearchIcon from '@lucide/svelte/icons/search';
 	import Trash2Icon from '@lucide/svelte/icons/trash-2';
-	import type { LocalChatSession } from '$lib/chat/sessions';
+	import type { ChatSession } from '$lib/api/types';
 	import { Button } from '$lib/components/ui/button';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import BrandMark from './BrandMark.svelte';
@@ -19,11 +19,11 @@
 		onOpenKnowledge,
 		onOpenQuickSearch
 	}: {
-		sessions: LocalChatSession[];
+		sessions: ChatSession[];
 		activeId: string;
 		onNew: () => void;
-		onOpen: (session: LocalChatSession) => void;
-		onDelete: (session: LocalChatSession) => void;
+		onOpen: (session: ChatSession) => void;
+		onDelete: (session: ChatSession) => void;
 		onOpenKnowledge: () => void;
 		onOpenQuickSearch: () => void;
 	} = $props();
@@ -92,7 +92,7 @@
 							<span class="min-w-0">
 								<span class="block truncate text-xs font-medium">{session.title}</span>
 								<span class="mt-1 block text-[10px] text-[var(--ink-faint)]"
-									>{relativeTime(session.updatedAt)}</span
+									>{relativeTime(session.updated_at)}</span
 								>
 							</span>
 						</button>
@@ -133,7 +133,7 @@
 			</div>
 			<div class="min-w-0">
 				<div class="text-xs font-semibold">企业知识工作台</div>
-				<div class="text-[10px] text-[var(--ink-faint)]">本机浏览器会话索引</div>
+				<div class="text-[10px] text-[var(--ink-faint)]">当前 Project 的私人会话</div>
 			</div>
 		</div>
 	</div>

@@ -16,9 +16,10 @@ import pdf_inspector
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from psycopg.rows import DictRow
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
+from authz import store as authz_store
 from rag import store
 from rag.chunking import chunk_text
 from shared.openai_responses import (
@@ -31,7 +32,6 @@ from shared.openai_responses import (
 from shared.openai_responses import (
     stream_delta as stream_content,
 )
-from shared.scope_token import verify_scope
 
 JsonObject = dict[str, object]
 
@@ -76,80 +76,70 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Enterprise AI Knowledge Base RAG", version="0.1.0", lifespan=lifespan)
 
 
-class KnowledgeBaseCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    description: str = Field(default="", max_length=500)
-
-
 class ProjectCreate(BaseModel):
-    kb_id: str = Field(default="company", min_length=1, max_length=100)
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=100)
     description: str = Field(default="", max_length=500)
 
 
 class RetrieveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     question: str = Field(min_length=1, max_length=2000)
-    kb_id: str = "company"
-    project_id: str = "default"
+    project_id: str = Field(min_length=1, max_length=200)
     top_k: int = Field(default=5, ge=1, le=10)
 
 
 class AskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     question: str = Field(min_length=1, max_length=2000)
-    kb_id: str = "company"
-    project_id: str = "default"
+    project_id: str = Field(min_length=1, max_length=200)
     top_k: int = Field(default=5, ge=1, le=10)
     history: list[dict[str, str]] = Field(default_factory=list)
     summary: str = ""
     stream: bool = False
 
 
-class ScopeResolve(BaseModel):
-    kb_id: str = "company"
-    project_id: str = "default"
-
-
 class DocumentImport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str = Field(min_length=1, max_length=200)
     content: str = Field(min_length=1)
-    kb_id: str = "company"
-    project_id: str = "default"
-    access_scope: str = "general"
+    project_id: str = Field(min_length=1, max_length=200)
     chunking_strategy: Literal["fixed", "recursive", "semantic", "paragraph"] = "recursive"
 
 
-def ensure_kb(kb_id: str) -> DictRow:
-    row = store.ensure_kb(kb_id)
+def ensure_company_kb() -> DictRow:
+    row = store.ensure_company_kb()
     if not row:
-        raise HTTPException(404, "知识库不存在")
+        raise HTTPException(404, "公司知识库不存在")
     return row
 
 
-def ensure_project(kb_id: str, project_id: str) -> DictRow:
-    row = store.ensure_project(kb_id, project_id)
+def ensure_project(project_id: str) -> DictRow:
+    row = store.ensure_project(project_id)
     if not row:
-        raise HTTPException(404, "项目范围不存在")
+        raise HTTPException(404, "Project 不存在")
     return row
 
 
-def resolve_project_id(kb_id: str, project_id: str) -> str:
-    """Validate a document scope in one synchronous worker-pool operation."""
-    _ = ensure_kb(kb_id)
-    return row_string(ensure_project(kb_id, project_id), "id")
+def resolve_project_id(project_id: str) -> str:
+    _ = ensure_company_kb()
+    return row_string(ensure_project(project_id), "id")
 
 
-def resolve_and_search(question: str, kb_id: str, project_id: str, scope_context: str, top_k: int) -> list[DictRow]:
-    """Canonicalize the project and run retrieval in one synchronous worker-pool call.
+def require_project_permission(principal_id: str, action: str, project_id: str) -> None:
+    if not authz_store.has_permission(principal_id, action, project_id):
+        raise HTTPException(403, "无权访问该 Project")
 
-    scope_context 是 authz 签发的不透明 capability;RAG 只验证签名与目标绑定,
-    再把其中的可见范围交给 RLS,不重新计算权限。
-    """
-    resolved_project_id = resolve_project_id(kb_id, project_id)
-    try:
-        visible_scope = verify_scope(scope_context, kb_id, resolved_project_id)
-    except ValueError as exc:
-        raise HTTPException(401, "访问范围凭证无效或已过期") from exc
-    return store.search(question, kb_id, resolved_project_id, visible_scope, top_k)
+
+def resolve_and_search(question: str, project_id: str, principal_id: str, top_k: int) -> list[DictRow]:
+    """Validate the Project and run retrieval under the stable Principal."""
+    resolved_project_id = resolve_project_id(project_id)
+    require_project_permission(principal_id, "retrieve", resolved_project_id)
+    return store.search(question, resolved_project_id, principal_id, top_k)
 
 
 def extract_text(filename: str, data: bytes) -> str:
@@ -181,9 +171,8 @@ def _index_uploaded_data(
     *,
     data: bytes,
     filename: str,
-    kb_id: str,
     project_id: str,
-    access_scope: str,
+    principal_id: str,
     chunking_strategy: str,
     on_progress: store.ProgressCallback | None = None,
 ) -> JsonObject:
@@ -202,11 +191,10 @@ def _index_uploaded_data(
     try:
         _ = stored_path.write_bytes(data)
         return store.insert_document(
-            kb_id=kb_id,
             project_id=project_id,
+            principal_id=principal_id,
             document_id=document_id,
             filename=filename,
-            access_scope=access_scope,
             parser=parser,
             pdf_type=pdf_type,
             pages_needing_ocr=pages_needing_ocr,
@@ -218,11 +206,6 @@ def _index_uploaded_data(
     except Exception:
         stored_path.unlink(missing_ok=True)
         raise
-
-
-def split_text(text: str, size: int = 700, overlap: int = 100) -> list[str]:
-    """Compatibility wrapper for the previous public helper; recursive is the new default."""
-    return chunk_text(text, strategy="recursive", size=size, overlap=overlap)
 
 
 def chunk_document(text: str, strategy: str) -> list[str]:
@@ -363,37 +346,35 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "enterprise-ai-knowledge-base-rag"}
 
 
-@app.get("/api/knowledge-bases")
-def list_kbs() -> list[JsonObject]:
-    return [dict(row) for row in store.list_kbs()]
-
-
-@app.post("/api/knowledge-bases")
-def create_kb(payload: KnowledgeBaseCreate) -> dict[str, str]:
-    return store.create_kb(payload.name, payload.description)
-
-
 @app.get("/api/projects")
-def list_projects(kb_id: str = "company") -> list[JsonObject]:
-    _ = ensure_kb(kb_id)
-    return [dict(row) for row in store.list_projects(kb_id)]
+def list_projects(x_principal: Annotated[str, Header(min_length=1, max_length=300)]) -> list[JsonObject]:
+    _ = ensure_company_kb()
+    project_ids = authz_store.list_accessible_project_ids(x_principal)
+    return [dict(row) for row in store.list_projects(project_ids)]
 
 
 @app.post("/api/projects")
-def create_project(payload: ProjectCreate) -> dict[str, str]:
-    _ = ensure_kb(payload.kb_id)
-    return store.create_project(payload.kb_id, payload.name, payload.description)
+def create_project(payload: ProjectCreate, x_principal: Annotated[str, Header(min_length=1, max_length=300)]) -> dict[str, str]:
+    if not authz_store.has_permission(x_principal, "project:create"):
+        raise HTTPException(403, "只有 Project Manager 或平台管理员可以创建 Project")
+    created = store.create_project(payload.name, payload.description)
+    try:
+        _ = authz_store.upsert_grant(x_principal, created["id"], "manager")
+    except Exception:
+        store.delete_project(created["id"])
+        raise
+    return {**created, "description": payload.description}
 
 
 @app.post("/api/documents/upload")
 async def upload_document(
     file: Annotated[UploadFile, File()],
-    kb_id: Annotated[str, Form()] = "company",
-    project_id: Annotated[str, Form()] = "default",
-    access_scope: Annotated[str, Form()] = "general",
+    x_principal: Annotated[str, Header(min_length=1, max_length=300)],
+    project_id: Annotated[str, Form()] = "",
     chunking_strategy: Annotated[Literal["fixed", "recursive", "semantic", "paragraph"], Form()] = "recursive",
 ) -> StreamingResponse:
-    project_id = await run_in_threadpool(resolve_project_id, kb_id, project_id)
+    project_id = await run_in_threadpool(resolve_project_id, project_id)
+    require_project_permission(x_principal, "document:write", project_id)
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件不能超过 10MB")
@@ -412,9 +393,8 @@ async def upload_document(
                     _index_uploaded_data,
                     data=data,
                     filename=filename,
-                    kb_id=kb_id,
                     project_id=project_id,
-                    access_scope=access_scope,
+                    principal_id=x_principal,
                     chunking_strategy=chunking_strategy,
                     on_progress=progress,
                 )
@@ -447,34 +427,32 @@ async def upload_document(
 
 
 @app.get("/api/documents")
-def list_documents(kb_id: str = "company") -> list[JsonObject]:
-    _ = ensure_kb(kb_id)
-    return [dict(row) for row in store.list_documents(kb_id)]
+def list_documents(
+    project_id: str,
+    x_principal: Annotated[str, Header(min_length=1, max_length=300)],
+) -> list[JsonObject]:
+    resolved_project_id = resolve_project_id(project_id)
+    require_project_permission(x_principal, "document:read", resolved_project_id)
+    return [dict(row) for row in store.list_documents(resolved_project_id, x_principal)]
 
 
 @app.get("/api/evidence/{chunk_id}")
 def get_evidence(
     chunk_id: str,
-    kb_id: str,
     project_id: str,
-    x_scope_context: Annotated[str, Header()] = "",
+    x_principal: Annotated[str, Header(min_length=1, max_length=300)],
 ) -> JsonObject:
-    # 行级可见性由 authz 的 RLS 策略强制;这里只透传不透明 scope_context,
-    # 一个 chunk id 无法读到可见范围之外的内容。
-    resolved_project_id = resolve_project_id(kb_id, project_id)
-    try:
-        visible_scope = verify_scope(x_scope_context, kb_id, resolved_project_id)
-    except ValueError as exc:
-        raise HTTPException(401, "访问范围凭证无效或已过期") from exc
-    row = store.get_evidence(chunk_id, kb_id, resolved_project_id, visible_scope)
+    resolved_project_id = resolve_project_id(project_id)
+    require_project_permission(x_principal, "evidence:read", resolved_project_id)
+    row = store.get_evidence(chunk_id, resolved_project_id, x_principal)
     if not row:
         raise HTTPException(404, "参考资料片段不存在")
     return dict(row)
 
 
 @app.post("/api/retrieve")
-def retrieve(payload: RetrieveRequest, x_scope_context: Annotated[str, Header()] = "") -> JsonObject:
-    sources = resolve_and_search(payload.question, payload.kb_id, payload.project_id, x_scope_context, payload.top_k)
+def retrieve(payload: RetrieveRequest, x_principal: Annotated[str, Header(min_length=1, max_length=300)]) -> JsonObject:
+    sources = resolve_and_search(payload.question, payload.project_id, x_principal, payload.top_k)
     chunks = [
         {
             "id": source["id"],
@@ -489,19 +467,9 @@ def retrieve(payload: RetrieveRequest, x_scope_context: Annotated[str, Header()]
     return {"chunks": chunks, "retrieved": len(chunks)}
 
 
-@app.post("/api/scope/resolve")
-def resolve_scope(payload: ScopeResolve) -> dict[str, str]:
-    # 只做项目 id 规范化,不做授权;保持会话服务在 Phase 3 前不破坏。
-    _ = ensure_kb(payload.kb_id)
-    project_id = row_string(ensure_project(payload.kb_id, payload.project_id), "id")
-    return {"kb_id": payload.kb_id, "project_id": project_id}
-
-
 @app.post("/api/ask", response_model=None)
-async def ask(payload: AskRequest, x_scope_context: Annotated[str, Header()] = "") -> JsonObject | StreamingResponse:
-    # Retrieval performs synchronous embedding and PostgreSQL calls; keep it off
-    # the event loop so a slow search cannot starve concurrent answer streams.
-    sources = await run_in_threadpool(resolve_and_search, payload.question, payload.kb_id, payload.project_id, x_scope_context, payload.top_k)
+async def ask(payload: AskRequest, x_principal: Annotated[str, Header(min_length=1, max_length=300)]) -> JsonObject | StreamingResponse:
+    sources = await run_in_threadpool(resolve_and_search, payload.question, payload.project_id, x_principal, payload.top_k)
     if payload.stream:
         return StreamingResponse(
             ask_stream(payload, sources),
@@ -514,24 +482,18 @@ async def ask(payload: AskRequest, x_scope_context: Annotated[str, Header()] = "
 
 
 @app.post("/api/v1/document/import")
-async def import_document(payload: DocumentImport) -> JsonObject:
-    # Scope validation performs synchronous PostgreSQL calls; keep it off the
-    # event loop along with semantic chunking and document indexing.
-    project_id = await run_in_threadpool(resolve_project_id, payload.kb_id, payload.project_id)
-    # Semantic chunking can make synchronous embedding requests, so it must
-    # also run in the worker pool before insert_document is scheduled there.
+async def import_document(payload: DocumentImport, x_principal: Annotated[str, Header(min_length=1, max_length=300)]) -> JsonObject:
+    project_id = await run_in_threadpool(resolve_project_id, payload.project_id)
+    require_project_permission(x_principal, "document:write", project_id)
     chunks = await run_in_threadpool(chunk_document, payload.content, payload.chunking_strategy)
     if not chunks:
         raise HTTPException(422, "文档内容不能为空")
-    # Keep the import endpoint non-blocking for the same reason as uploads:
-    # indexing performs synchronous embedding, LLM, and PostgreSQL operations.
     return await run_in_threadpool(
         store.insert_document,
-        kb_id=payload.kb_id,
         project_id=project_id,
+        principal_id=x_principal,
         document_id=uuid.uuid4().hex,
         filename=payload.title,
-        access_scope=payload.access_scope,
         parser="plain-text",
         pdf_type=None,
         pages_needing_ocr=[],

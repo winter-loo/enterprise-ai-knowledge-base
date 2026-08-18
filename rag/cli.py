@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
+from authz import store as authz_store
 from rag import main as rag_main
 from rag import store
 
@@ -25,9 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("directory", help="要扫描的目录，递归读取其中所有文件")
     parser.add_argument("--ext", default="", help="只处理指定后缀，逗号分隔（如 md,txt,pdf）；默认处理所有可解析文件")
-    parser.add_argument("--kb-id", default="company", help="知识库 id（默认 company）")
-    parser.add_argument("--project-id", default="default", help="项目 id（默认 default）")
-    parser.add_argument("--access-scope", default="general", help="不透明访问范围（默认 general，即公共范围）")
+    parser.add_argument("--project-id", required=True, help="目标 Project id")
+    parser.add_argument("--principal-id", default="admin", help="执行导入的 Principal id（默认开发管理员 admin）")
     parser.add_argument(
         "--chunking-strategy",
         choices=["fixed", "recursive", "semantic", "paragraph"],
@@ -56,9 +56,8 @@ def collect_files(directory: Path, extensions: set[str] | None) -> list[Path]:
 def import_one(
     path: Path,
     *,
-    kb_id: str,
     project_id: str,
-    access_scope: str,
+    principal_id: str,
     chunking_strategy: str,
     on_progress: store.ProgressCallback | None = None,
 ) -> tuple[str, str]:
@@ -76,11 +75,10 @@ def import_one(
         if on_progress is not None:
             on_progress({"stage": "chunking", "message": "切分文档", "completed": len(chunks), "total": len(chunks), "percent": 30})
         store.insert_document(
-            kb_id=kb_id,
             project_id=project_id,
+            principal_id=principal_id,
             document_id=uuid.uuid4().hex,
             filename=path.name,
-            access_scope=access_scope,
             parser=parser,
             pdf_type=pdf_type,
             pages_needing_ocr=pages_needing_ocr,
@@ -119,14 +117,17 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"初始化数据库失败：{exc}", file=sys.stderr)
         return 1
-    if store.ensure_kb(args.kb_id) is None:
-        print(f"知识库不存在：{args.kb_id}", file=sys.stderr)
+    if store.ensure_company_kb() is None:
+        print("公司知识库不存在", file=sys.stderr)
         return 1
-    project = store.ensure_project(args.kb_id, args.project_id)
+    project = store.ensure_project(args.project_id)
     if project is None:
         print(f"项目范围不存在：{args.project_id}", file=sys.stderr)
         return 1
     resolved_project_id = str(project["id"])
+    if not authz_store.has_permission(args.principal_id, "document:write", resolved_project_id):
+        print("没有向该 Project 导入文档的权限。", file=sys.stderr)
+        return 1
 
     files = collect_files(directory, normalize_extensions(args.ext))
     if not files:
@@ -142,9 +143,8 @@ def main(argv: list[str] | None = None) -> int:
 
         status, detail = import_one(
             path,
-            kb_id=args.kb_id,
             project_id=resolved_project_id,
-            access_scope=args.access_scope,
+            principal_id=args.principal_id,
             chunking_strategy=args.chunking_strategy,
             on_progress=show_progress,
         )

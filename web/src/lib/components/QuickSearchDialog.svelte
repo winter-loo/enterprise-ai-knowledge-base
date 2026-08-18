@@ -4,9 +4,13 @@
 	import FileTextIcon from '@lucide/svelte/icons/file-text';
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import SearchIcon from '@lucide/svelte/icons/search';
-	import type { AskResponse, ChatPromptMessage, ChatSource } from '$lib/api/types';
+	import type {
+		AskResponse,
+		ChatPromptMessage,
+		ChatSource,
+		ProjectReference
+	} from '$lib/api/types';
 	import { rag } from '$lib/api/client';
-	import type { ChatScope } from '$lib/chat/scope-policy';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as Dialog from '$lib/components/ui/dialog';
@@ -17,15 +21,15 @@
 
 	let {
 		open = $bindable(false),
-		scope,
+		project,
 		history
-	}: { open: boolean; scope: ChatScope; history: ChatPromptMessage[] } = $props();
+	}: { open: boolean; project: ProjectReference; history: ChatPromptMessage[] } = $props();
 	let question = $state('');
 	let topK = $state(5);
 	let loading = $state(false);
 	let result = $state<AskResponse>();
 	let requestController: AbortController | undefined;
-	let previousScopeKey = '';
+	let previousProjectId = '';
 	let detailOpen = $state(false);
 	let detailSource = $state<ChatSource | null>(null);
 
@@ -37,9 +41,8 @@
 	}
 
 	$effect(() => {
-		const scopeKey = `${scope.kbId}\u0000${scope.projectId}\u0000${scope.accessScope}`;
-		if (!open || (previousScopeKey && previousScopeKey !== scopeKey)) cancelSearch();
-		previousScopeKey = scopeKey;
+		if (!open || (previousProjectId && previousProjectId !== project.projectId)) cancelSearch();
+		previousProjectId = project.projectId;
 	});
 
 	onDestroy(() => requestController?.abort());
@@ -56,9 +59,7 @@
 			const nextResult = await rag.ask(
 				{
 					question: question.trim(),
-					kb_id: scope.kbId,
-					project_id: scope.projectId,
-					access_scope: scope.accessScope,
+					project_id: project.projectId,
 					top_k: topK,
 					history
 				},
@@ -150,4 +151,4 @@
 	</Dialog.Content>
 </Dialog.Root>
 
-<EvidenceDialog bind:open={detailOpen} source={detailSource} {scope} />
+<EvidenceDialog bind:open={detailOpen} source={detailSource} {project} />

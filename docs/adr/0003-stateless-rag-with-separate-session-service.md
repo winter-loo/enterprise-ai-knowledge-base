@@ -4,6 +4,10 @@ status: accepted
 
 # RAG is stateless; conversation state lives in a separate session service
 
+> **Authorization note superseded in part by [ADR 0005](0005-project-grants-with-principal-rls.md).**
+> The service separation remains valid; the descriptions of plaintext Scope fields
+> and session credentials do not. Requests now use a trusted Principal and a Project.
+
 The knowledge base is split into two independently deployable services: a RAG service that ingests documents and answers queries, and a session service that owns conversation history. The RAG service's two primitives — Retrieve and Ask — are stateless: conversation History is passed inline with each Ask request and never persisted by RAG. The session service is a client of the RAG HTTP API, exactly like an external AI agent, and adds only session credentials, per-turn persistence, and the clear-vs-stream race handling. This split lets the RAG capability be reused by the team's own session management or by external agents (Codex, Claude, etc.) without carrying any chat-state baggage.
 
 ## Considered Options
@@ -15,7 +19,7 @@ The knowledge base is split into two independently deployable services: a RAG se
 
 ## Consequences
 
-- The four task-book compatibility endpoints are preserved: `POST /api/v1/document/import` stays on the RAG service; `POST /api/v1/chat/completions`, `GET /api/v1/chat/history/{sessionId}`, and `DELETE /api/v1/chat/session/{sessionId}` stay on the session service.
-- RAG owns `knowledge_bases`, `projects`, and `knowledge_evidence`; session owns `chat_messages` and `chat_session_tombstones`. They share one PostgreSQL database but touch disjoint tables.
-- The RAG service is network-trusted: it does not authenticate callers, and Scope fields are passed as plaintext. Real SSO/RBAC is out of scope and belongs to an outer gateway or the caller.
+- The public service responsibilities stay split: document import remains on RAG; completions, history, and Session deletion remain on the session service.
+- RAG owns `knowledge_bases`, `projects`, and `knowledge_evidence`; session owns `chat_sessions`, `chat_messages`, and `chat_session_summaries`. They share one PostgreSQL database but touch disjoint tables.
+- The authorization model in this ADR is superseded by ADR 0005: a trusted gateway supplies the Principal, and both services enforce Project Grants through RLS.
 - History size handed to Ask is the session service's responsibility; RAG does not remember anything between calls.

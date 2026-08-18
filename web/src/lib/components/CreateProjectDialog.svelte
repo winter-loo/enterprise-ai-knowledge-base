@@ -8,19 +8,16 @@
 
 	let {
 		open = $bindable(false),
-		kind,
 		loading = false,
 		onSubmit
 	}: {
 		open: boolean;
-		kind: 'knowledge-base' | 'project';
 		loading?: boolean;
 		onSubmit: (name: string, description: string) => Promise<boolean>;
 	} = $props();
 
 	let name = $state('');
 	let description = $state('');
-	let isKnowledgeBase = $derived(kind === 'knowledge-base');
 
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
@@ -35,30 +32,26 @@
 <Dialog.Root bind:open>
 	<Dialog.Content class="rounded-2xl border border-[var(--line)] bg-[var(--paper)] p-7 sm:max-w-lg">
 		<Dialog.Header>
-			<Dialog.Title class="font-heading text-2xl font-medium"
-				>新建{isKnowledgeBase ? '知识库' : '项目'}</Dialog.Title
-			>
+			<Dialog.Title class="font-heading text-2xl font-medium">新建 Project</Dialog.Title>
 			<Dialog.Description class="leading-6">
-				{isKnowledgeBase
-					? '创建一套独立的企业知识边界，并自动生成默认项目。'
-					: '在当前知识库内创建更聚焦的检索范围。'}
+				Project 是知识检索与授权的最小边界。创建后你会成为它的 Manager。
 			</Dialog.Description>
 		</Dialog.Header>
 		<form class="grid gap-5" onsubmit={submit}>
 			<div class="grid gap-2">
-				<Label for="scope-name">名称</Label>
+				<Label for="project-name">Project 名称</Label>
 				<Input
-					id="scope-name"
+					id="project-name"
 					bind:value={name}
 					maxlength={100}
-					placeholder={isKnowledgeBase ? '例如：公司制度中心' : '例如：星河发布计划'}
+					placeholder="例如：星河发布计划"
 					required
 				/>
 			</div>
 			<div class="grid gap-2">
-				<Label for="scope-description">说明（可选）</Label>
+				<Label for="project-description">说明（可选）</Label>
 				<Textarea
-					id="scope-description"
+					id="project-description"
 					bind:value={description}
 					maxlength={500}
 					placeholder="帮助团队理解这组资料的用途和边界"

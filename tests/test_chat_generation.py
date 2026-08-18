@@ -31,6 +31,8 @@ class StaleGenerationConnection:
             assert params is not None
             assert params[-1] == store.GENERATION_LEASE_SECONDS
             self.stale_pending = False
+        if normalized.startswith("SELECT project_id, title FROM chat_sessions"):
+            return QueryResult({"project_id": "p-1", "title": "新的研究"})
         if normalized.startswith("SELECT 1 FROM chat_messages") and "generation_complete=FALSE" in normalized:
             return QueryResult({"exists": 1} if self.stale_pending else None)
         return QueryResult()
@@ -41,19 +43,16 @@ class StaleGenerationConnection:
 
 def test_stale_generation_lease_is_reclaimed_before_active_check(monkeypatch):
     connection = StaleGenerationConnection()
-    monkeypatch.setattr(store, "connect", lambda: connection)
+    monkeypatch.setattr(store, "connect", lambda _principal: connection)
 
     state = store.begin_generation(
         "session-1",
-        "t" * 32,
+        "alice",
         "retry after crash",
         "generation-2",
-        "company",
-        "p-1",
-        "engineering",
     )
 
-    assert state == {"summary": "", "verbatim": [], "should_compact": False}
+    assert state == {"summary": "", "verbatim": [], "should_compact": False, "project_id": "p-1"}
     assert connection.committed is True
     cleanup_index = next(index for index, query in enumerate(connection.queries) if query.startswith("DELETE FROM chat_messages"))
     active_index = next(index for index, query in enumerate(connection.queries) if query.startswith("SELECT 1 FROM chat_messages"))

@@ -14,14 +14,11 @@ import psycopg
 from psycopg.rows import DictRow, dict_row
 from psycopg.sql import SQL
 
+from shared.database_security import PRINCIPAL_SETTING, require_runtime_database_safety, schema_provisioning_enabled
 from shared.openai_responses import build_response_input, build_response_request, response_answer_text
 
 EMBEDDING_DIMENSIONS = 1024
-# 行级可见性的会话设置名,与 authz 服务的 RLS 策略约定一致:RAG 把调用方传来的
-# 不透明 scope_context 写入该设置,由 Postgres RLS 行级过滤 knowledge_evidence。
-# RAG 不解释 scope_context 的含义('*' 表示全项目可见)。
-SCOPE_SETTING = "app.visible_scope"
-SCOPE_ALL = "*"
+COMPANY_KB_ID = "company"
 # Qwen3 Embedding 属于支持 instruction-aware retrieval 的向量模型。相同的一段文字, 在不同任务下可能应该产生不同的向量表示。
 # 这条指令告诉模型:
 # - 输入是用户查询, 不是普通文档
@@ -57,14 +54,13 @@ class EmbeddingUnavailableError(RuntimeError):
     """Embedding 服务在有限重试后仍无法完成请求。"""
 
 
-def connect(scope_context: str = SCOPE_ALL) -> psycopg.Connection[DictRow]:
+def connect(principal_id: str = "") -> psycopg.Connection[DictRow]:
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
     conn = psycopg.Connection[DictRow].connect(database_url, row_factory=dict_row)
-    # 把 authz 计算好的不透明可见范围应用到当前事务;Postgres RLS 策略据此在
-    # 行级过滤 knowledge_evidence。RAG 只做透传,不知道 scope_context 的含义。
-    conn.execute(f"SELECT set_config('{SCOPE_SETTING}', %s, true)", (scope_context,))
+    # Every transaction records the stable Principal; RLS denies when it is absent.
+    conn.execute(f"SELECT set_config('{PRINCIPAL_SETTING}', %s, true)", (principal_id,))
     return conn
 
 
@@ -74,11 +70,14 @@ def now() -> str:
 
 def init_db() -> None:
     with connect() as conn:
-        legacy = conn.execute("SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_evidence' AND column_name='department'").fetchone()
+        legacy = conn.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_name='knowledge_evidence' AND column_name IN ('department', 'access_scope')"
+        ).fetchone()
         if legacy is not None:
-            _ = conn.execute("DROP TABLE knowledge_evidence CASCADE")
-        _ = conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        _ = conn.execute("""
+            raise RuntimeError("检测到旧 scope 数据结构；请先运行 make reset-dev-data")
+        if schema_provisioning_enabled():
+            _ = conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            _ = conn.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_bases (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL
             );
@@ -89,13 +88,13 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS knowledge_evidence (
                 id TEXT PRIMARY KEY, kb_id TEXT NOT NULL REFERENCES knowledge_bases(id), project_id TEXT NOT NULL REFERENCES projects(id),
                 document_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, content TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',
-                embedding vector(1024) NOT NULL, access_scope TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'READY',
+                embedding vector(1024) NOT NULL, status TEXT NOT NULL DEFAULT 'READY',
                 source_type TEXT NOT NULL DEFAULT 'upload', source_uri TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
                 page INTEGER, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_evidence_scope ON knowledge_evidence(kb_id, project_id, access_scope, status);
+            CREATE INDEX IF NOT EXISTS idx_evidence_project ON knowledge_evidence(kb_id, project_id, status);
             CREATE INDEX IF NOT EXISTS idx_evidence_fts ON knowledge_evidence USING GIN (to_tsvector('simple', content));
-        """)
+            """)
         dimension_row = conn.execute("""
             SELECT atttypmod FROM pg_attribute
             WHERE attrelid='knowledge_evidence'::regclass AND attname='embedding'
@@ -111,51 +110,57 @@ def init_db() -> None:
             if count:
                 raise RuntimeError(f"knowledge_evidence contains {count} incompatible vectors; clear it and restart")
             _ = conn.execute(SQL("ALTER TABLE knowledge_evidence ALTER COLUMN embedding TYPE vector(1024)"))
-        _ = conn.execute(
-            "INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("company", "公司知识库", "默认企业政策、产品和技术文档", now())
-        )
-        _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", ("default", "company", "默认项目", "默认项目范围", now()))
-        conn.commit()
+        if schema_provisioning_enabled():
+            _ = conn.execute(
+                "INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (COMPANY_KB_ID, "公司知识库", "默认企业政策、产品和技术文档", now()),
+            )
+            conn.commit()
+        else:
+            require_runtime_database_safety(conn, ("knowledge_bases", "projects", "knowledge_evidence"))
+    # Authz owns the policies; RAG triggers their idempotent installation after table creation.
+    from authz import store as authz_store
+
+    authz_store.apply_rls_for_current_database()
 
 
-def ensure_kb(kb_id: str) -> DictRow | None:
+def ensure_company_kb() -> DictRow | None:
     with connect() as conn:
-        return conn.execute("SELECT * FROM knowledge_bases WHERE id=%s", (kb_id,)).fetchone()
+        return conn.execute("SELECT * FROM knowledge_bases WHERE id=%s", (COMPANY_KB_ID,)).fetchone()
 
 
-def ensure_project(kb_id: str, project_id: str) -> DictRow | None:
+def ensure_project(project_id: str) -> DictRow | None:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM projects WHERE kb_id=%s AND id=%s", (kb_id, project_id)).fetchone()
-        if not row and project_id == "default":
-            row = conn.execute("SELECT * FROM projects WHERE kb_id=%s ORDER BY created_at LIMIT 1", (kb_id,)).fetchone()
-        return row
+        return conn.execute("SELECT * FROM projects WHERE kb_id=%s AND id=%s", (COMPANY_KB_ID, project_id)).fetchone()
 
 
-def list_kbs() -> list[DictRow]:
+def list_projects(project_ids: list[str] | None = None) -> list[DictRow]:
     with connect() as conn:
-        return conn.execute("SELECT * FROM knowledge_bases ORDER BY created_at").fetchall()
+        if project_ids is not None:
+            if not project_ids:
+                return []
+            return conn.execute(
+                "SELECT id, name, description, created_at FROM projects WHERE kb_id=%s AND id = ANY(%s) ORDER BY created_at",
+                (COMPANY_KB_ID, project_ids),
+            ).fetchall()
+        return conn.execute(
+            "SELECT id, name, description, created_at FROM projects WHERE kb_id=%s ORDER BY created_at",
+            (COMPANY_KB_ID,),
+        ).fetchall()
 
 
-def create_kb(name: str, description: str) -> dict[str, str]:
-    kb_id, project_id = uuid.uuid4().hex[:12], uuid.uuid4().hex[:12]
-    with connect() as conn:
-        _ = conn.execute("INSERT INTO knowledge_bases VALUES(%s,%s,%s,%s)", (kb_id, name, description, now()))
-        _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s)", (project_id, kb_id, "默认项目", "默认项目范围", now()))
-        conn.commit()
-    return {"id": kb_id, "name": name, "description": description, "default_project_id": project_id}
-
-
-def list_projects(kb_id: str) -> list[DictRow]:
-    with connect() as conn:
-        return conn.execute("SELECT * FROM projects WHERE kb_id=%s ORDER BY created_at", (kb_id,)).fetchall()
-
-
-def create_project(kb_id: str, name: str, description: str) -> dict[str, str]:
+def create_project(name: str, description: str) -> dict[str, str]:
     project_id = uuid.uuid4().hex[:12]
     with connect() as conn:
-        _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s)", (project_id, kb_id, name, description, now()))
+        _ = conn.execute("INSERT INTO projects VALUES(%s,%s,%s,%s,%s)", (project_id, COMPANY_KB_ID, name, description, now()))
         conn.commit()
     return {"id": project_id, "name": name}
+
+
+def delete_project(project_id: str) -> None:
+    with connect() as conn:
+        _ = conn.execute("DELETE FROM projects WHERE id=%s", (project_id,))
+        conn.commit()
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -249,11 +254,10 @@ def vector_literal(vector: list[float]) -> str:
 
 def insert_document(
     *,
-    kb_id: str,
     project_id: str,
+    principal_id: str,
     document_id: str,
     filename: str,
-    access_scope: str,
     parser: str,
     pdf_type: str | None,
     pages_needing_ocr: list[int],
@@ -276,24 +280,23 @@ def insert_document(
 
     summaries = summarize_chunks(chunks, on_progress=summary_progress) if on_progress is not None else summarize_chunks(chunks)
     created = now()
-    with connect() as conn:
+    with connect(principal_id) as conn:
         for index, (content, vector, summary) in enumerate(zip(chunks, vectors, summaries, strict=True)):
             _ = conn.execute(
                 """
                 INSERT INTO knowledge_evidence
-                (id,kb_id,project_id,document_id,chunk_index,content,summary,embedding,access_scope,status,source_type,source_uri,filename,page,metadata,created_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,'READY','upload',%s,%s,NULL,%s::jsonb,%s)
+                (id,kb_id,project_id,document_id,chunk_index,content,summary,embedding,status,source_type,source_uri,filename,page,metadata,created_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s::vector,'READY','upload',%s,%s,NULL,%s::jsonb,%s)
             """,
                 (
                     uuid.uuid4().hex,
-                    kb_id,
+                    COMPANY_KB_ID,
                     project_id,
                     document_id,
                     index,
                     content,
                     summary,
                     vector_literal(vector),
-                    access_scope,
                     stored_path,
                     filename,
                     json.dumps({"parser": parser, "pdf_type": pdf_type, "pages_needing_ocr": pages_needing_ocr, "chunking_strategy": chunking_strategy}),
@@ -315,30 +318,28 @@ def insert_document(
     }
 
 
-def list_documents(kb_id: str) -> list[DictRow]:
-    with connect() as conn:
+def list_documents(project_id: str, principal_id: str) -> list[DictRow]:
+    with connect(principal_id) as conn:
         return conn.execute(
             """
             SELECT document_id AS id, max(filename) AS filename, max(project_id) AS project_id,
-                   max(access_scope) AS access_scope, max(status) AS status, count(*) AS chunk_count,
+                   max(status) AS status, count(*) AS chunk_count,
                    max(source_type) AS source_type, max(metadata->>'parser') AS parser,
                    max(metadata->>'pdf_type') AS pdf_type, max(metadata->>'chunking_strategy') AS chunking_strategy,
                    max(created_at) AS created_at
-            FROM knowledge_evidence WHERE kb_id=%s GROUP BY document_id ORDER BY max(created_at) DESC
+            FROM knowledge_evidence WHERE kb_id=%s AND project_id=%s GROUP BY document_id ORDER BY max(created_at) DESC
         """,
-            (kb_id,),
+            (COMPANY_KB_ID, project_id),
         ).fetchall()
 
 
-def search(question: str, kb_id: str, project_id: str, scope_context: str, top_k: int) -> list[DictRow]:
+def search(question: str, project_id: str, principal_id: str, top_k: int) -> list[DictRow]:
     instructed = f"Instruct: {QUERY_INSTRUCTION}\nQuery: {question}"
     query_vector = vector_literal(embed([instructed])[0])
-    with connect(scope_context) as conn:
+    with connect(principal_id) as conn:
         return conn.execute(
             """
-            -- 候选集只包含当前知识库和 Project 中已完成索引的片段。行级可见性
-            -- 由 authz 拥有的 Postgres RLS 策略强制,本 SQL 不含任何权限谓词:
-            -- connect() 已把不透明 scope_context 写入会话设置,数据库在行级过滤。
+            -- 候选集只包含当前 Project；RLS 根据当前 Principal 再次强制授权。
             WITH candidates AS (
                 SELECT e.*,
                        -- pgvector 的 <=> 返回余弦距离:cosine_distance = 1 - cosine_similarity。
@@ -366,18 +367,18 @@ def search(question: str, kb_id: str, project_id: str, scope_context: str, top_k
             -- 按混合分降序,只返回调用方要求的 top_k 个片段。
             ORDER BY score DESC LIMIT %s
         """,
-            (query_vector, question, kb_id, project_id, top_k),
+            (query_vector, question, COMPANY_KB_ID, project_id, top_k),
         ).fetchall()
 
 
-def get_evidence(chunk_id: str, kb_id: str, project_id: str, scope_context: str) -> DictRow | None:
-    with connect(scope_context) as conn:
+def get_evidence(chunk_id: str, project_id: str, principal_id: str) -> DictRow | None:
+    with connect(principal_id) as conn:
         return conn.execute(
             """
-            SELECT id, filename, chunk_index, content, summary, access_scope, project_id,
+            SELECT id, filename, chunk_index, content, summary, project_id,
                    document_id, source_type, source_uri, page, metadata, created_at
             FROM knowledge_evidence
             WHERE id=%s AND kb_id=%s AND project_id=%s
             """,
-            (chunk_id, kb_id, project_id),
+            (chunk_id, COMPANY_KB_ID, project_id),
         ).fetchone()

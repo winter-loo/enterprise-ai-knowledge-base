@@ -1,13 +1,11 @@
 export type ChunkingStrategy = 'fixed' | 'recursive' | 'semantic' | 'paragraph';
 
-export interface ScopePayload {
-	kb_id: string;
-	project_id: string;
+export interface ProjectReference {
+	projectId: string;
 }
 
-/** RAG 服务的不透明访问范围：access_scope 由 authz 计算, 由调用方透传。 */
-export interface RagScope extends ScopePayload {
-	access_scope: string;
+export interface ProjectPayload {
+	project_id: string;
 }
 
 export interface HealthResponse {
@@ -15,59 +13,24 @@ export interface HealthResponse {
 	service: string;
 }
 
-export type VisibleScopeRequest = ScopePayload;
-
-export interface VisibleScopeResponse {
-	allowed: boolean;
-	project_id: string | null;
-	scope_context: string;
-}
-
-export interface KnowledgeBase {
-	id: string;
-	name: string;
-	description: string;
-	created_at: string;
-}
-
-export interface KnowledgeBaseCreateRequest {
-	name: string;
-	description?: string;
-}
-
-export interface KnowledgeBaseCreateResponse {
-	id: string;
-	name: string;
-	description: string;
-	default_project_id: string;
-}
-
 export interface Project {
 	id: string;
-	kb_id: string;
 	name: string;
 	description: string;
 	created_at: string;
 }
 
 export interface ProjectCreateRequest {
-	kb_id: string;
 	name: string;
 	description?: string;
 }
 
-export interface ProjectCreateResponse {
-	id: string;
-	name: string;
-	kb_id?: string;
-	description?: string;
-}
+export type ProjectCreateResponse = Project;
 
 export interface DocumentRecord {
 	id: string;
 	filename: string;
 	project_id: string;
-	access_scope: string;
 	status: string;
 	chunk_count: number;
 	source_type: string;
@@ -109,11 +72,11 @@ export interface IndexProgressEvent {
 	result?: ImportResult;
 }
 
-export interface UploadDocumentRequest extends RagScope {
+export interface UploadDocumentRequest extends ProjectPayload {
 	chunking_strategy?: ChunkingStrategy;
 }
 
-export interface DocumentImportRequest extends RagScope {
+export interface DocumentImportRequest extends ProjectPayload {
 	title: string;
 	content: string;
 	chunking_strategy?: ChunkingStrategy;
@@ -126,7 +89,7 @@ export interface ChatPromptMessage {
 	content: string;
 }
 
-export interface AskRequest extends RagScope {
+export interface AskRequest extends ProjectPayload {
 	question: string;
 	top_k?: number;
 	history?: ChatPromptMessage[];
@@ -157,7 +120,7 @@ export interface RetrieveChunk {
 	summary: string;
 }
 
-export interface RetrieveRequest extends RagScope {
+export interface RetrieveRequest extends ProjectPayload {
 	question: string;
 	top_k?: number;
 }
@@ -173,7 +136,6 @@ export interface EvidenceDetail {
 	chunk_index: number;
 	content: string;
 	summary: string;
-	access_scope: string;
 	project_id: string;
 	document_id: string;
 	source_type: string;
@@ -183,10 +145,21 @@ export interface EvidenceDetail {
 	created_at: string;
 }
 
-export interface ChatCompletionRequest extends ScopePayload {
+export interface ChatSession {
+	id: string;
+	project_id: string;
+	title: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ChatSessionCreateRequest {
+	project_id: string;
+}
+
+export interface ChatCompletionRequest {
 	session_id: string;
 	question: string;
-	department: string;
 	top_k?: number;
 }
 
@@ -203,7 +176,7 @@ export interface ChatHistoryResponse {
 
 export interface ClearSessionResponse {
 	session_id: string;
-	deleted: number;
+	deleted: boolean;
 }
 
 export interface ChatSource {
